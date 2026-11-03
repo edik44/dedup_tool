@@ -1,0 +1,6 @@
+# dictionaries, results and logs of your own runs
+*.txt
+logs/
+Compare Files/
+originals_*/
+*_parts/
