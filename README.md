@@ -27,8 +27,18 @@ A typical use: you collect password or login dictionaries from different sources
 
 - Bash 4.2 or newer (5.x recommended), GNU coreutils (`sort`, `comm`, `split`, `stat`, `mkfifo`, `df`, `od`), GNU `grep` with `-P`, GNU `sed`, `awk`, `iconv`.
 - Works in **Git for Windows** (Git Bash), **WSL** and **Linux**. macOS is not tested; it needs the GNU tools (`brew install coreutils grep gnu-sed`).
+- On Windows you need [Git for Windows](https://git-scm.com/download/win) (free): it brings bash and these tools. `dedup_tool_first_windows_start.bat` checks for it and offers to install it.
 
 ## Install
+
+### Windows
+
+1. Download `dedup_tool.sh` and `dedup_tool_first_windows_start.bat` from the [latest release](https://github.com/edik44/dedup_tool/releases/latest) and put both into the folder with your dictionaries.
+2. Double-click `dedup_tool_first_windows_start.bat`. It checks for Git for Windows and, if it is missing, offers to install it with winget (Windows asks for administrator rights) or to open the download page. Then the menu starts in that folder.
+3. After that the `.bat` is not needed: double-click `dedup_tool.sh` itself — Git for Windows opens `.sh` files in Git Bash. Delete the `.bat` or keep it, it works every time.
+4. Windows may warn that the file comes from the internet: allow it to run (SmartScreen: "More info" → "Run anyway").
+
+### Linux, WSL, Git Bash
 
 ```bash
 git clone https://github.com/edik44/dedup_tool.git
@@ -45,6 +55,7 @@ Put your dictionaries (`*.txt`) next to the script and the reference files into 
 ```
 your_folder/
 ├── dedup_tool.sh
+├── dedup_tool_first_windows_start.bat  ← the first start on Windows
 ├── new_words.txt            ← working files
 ├── more_words.txt
 └── Compare Files/
@@ -52,7 +63,7 @@ your_folder/
     └── 02_other_base.txt
 ```
 
-Run `./dedup_tool.sh` (on Windows a double click on the file in Explorer works too) and choose an item:
+Run `./dedup_tool.sh` (on Windows — a double click on it; the very first time — on `dedup_tool_first_windows_start.bat`) and choose an item:
 
 ```
   1) Full processing: preparation and comparison with references → <name>_final.txt
@@ -106,6 +117,7 @@ A result converted from Windows-1251 can be bigger than the source: in UTF-8 a C
 
 ## Big files
 
+- **Git Bash or WSL.** Dictionaries up to about 1 GB are comfortable in Git Bash, right on Windows (it depends on the PC). Bigger ones are better in WSL: the same work runs there 3–4 times faster (a 95 MB dictionary with a 48 MB reference: 12 s in Git Bash, 3.5 s in WSL).
 - **Memory.** `sort` takes up to half of the free memory and up to 8 threads; what does not fit goes into its temporary files next to the result. In WSL the Linux file cache takes the rest, so WSL looks almost full in the Task Manager — this is normal. `wsl --shutdown` returns the memory after the work.
 - **Disk.** In WSL a 6.5 GB dictionary with an 8.1 GB reference means, by estimate, about 70 GB written the first time (copies to the Linux folder and back, sorting the reference, the temporary files of `sort`, the result) and about 40 GB later. You need about three times the size of the dictionaries and references together in free space. Keep big files inside Linux (`\\wsl.localhost\<distribution>\home\<user>` in Explorer) — then nothing is copied.
 - **HDD.** It works, but slower: especially copying when the dictionaries and the Linux disk are on the same HDD, and sorting big files. If you have an SSD, keep the Linux disk (`ext4.vhdx`) and the working folder there.

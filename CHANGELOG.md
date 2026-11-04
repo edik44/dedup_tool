@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0 — 2026-11-05
+
+- `dedup_tool_first_windows_start.bat` for the first start on Windows: put it next to `dedup_tool.sh` and double-click it. It finds Git for Windows (Git Bash) and runs the script in its folder, showing where Git was found; if Git is missing, it offers to install it with winget or to open the download page. After that a double click on `dedup_tool.sh` itself is enough. Russian and English messages, by the Windows language or `--lang`.
+- The help tells how to start the script on Windows, and that dictionaries up to about 1 GB are comfortable in Git Bash, while bigger ones are 3–4 times faster in WSL.
+
 ## 1.0.0 — 2026-11-04
 
 The first public release.

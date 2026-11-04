@@ -22,7 +22,7 @@ if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
 fi
 
 # Settings. DEDUP_WORK_ROOT — where the WSL temp folders go.
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_TIMEOUT=20
 DEFAULT_SPLIT_SIZE="2G"
@@ -539,11 +539,14 @@ show_help_ru() {
     echo "  ./${SCRIPT_NAME}               главное меню — обычный способ работы"
     echo "  ./${SCRIPT_NAME} --help | -h   эта справка"
     echo "  ./${SCRIPT_NAME} --version     показать версию и выйти"
-    echo "  В Windows можно и двойным нажатием на файл в Проводнике (откроется Git Bash)."
     echo "  ./${SCRIPT_NAME} --lang en     интерфейс по-английски (--lang ru — по-русски)"
     echo "  Язык сам выбирается по языку системы (в Git Bash и WSL — по языку Windows)."
     echo "  Пункт 8 меню «Язык / Language» меняет его и запоминает выбор; ещё можно"
     echo "  задать переменную DEDUP_LANG=ru или en."
+    echo "  Первый запуск в Windows: dedup_tool_first_windows_start.bat рядом со скриптом —"
+    echo "  двойное нажатие. Он найдёт Git for Windows (нет — предложит установить) и"
+    echo "  запустит скрипт в своей папке. Потом этот файл не нужен: скрипт запускается и"
+    echo "  сам — двойным нажатием на файл в Проводнике."
     echo
     echo -e "${GREEN}─── Меню ───────────────────────────────────────────────────${NC}"
     echo "  1  Полная обработка: подготовка → сортировка → сравнение с эталонами"
@@ -677,6 +680,9 @@ show_help_ru() {
     echo "  (пункт 5) эталоны не нужны."
     echo
     echo -e "${GREEN}─── Большие словари (гигабайты) ────────────────────────────${NC}"
+    echo "  Git Bash или WSL: словари примерно до 1 ГБ удобно обрабатывать и в Git Bash,"
+    echo "  прямо в Windows (это зависит от ПК). С большими лучше WSL: там та же работа"
+    echo "  идёт в 3–4 раза быстрее."
     echo "  На долгих шагах — копирование в папку Linux и обратно, сортировка эталона,"
     echo "  проход, объединение — нижняя строка раз в 5 с показывает, сколько прошло"
     echo "  и сколько готово: скрипт не завис."
@@ -739,11 +745,14 @@ show_help_en() {
     echo "  ./${SCRIPT_NAME}               main menu — the usual way to work"
     echo "  ./${SCRIPT_NAME} --help | -h   this help"
     echo "  ./${SCRIPT_NAME} --version     show the version and exit"
-    echo "  On Windows a double click on the file in Explorer works too (opens Git Bash)."
     echo "  ./${SCRIPT_NAME} --lang ru     Russian interface (--lang en — English)"
     echo "  The language follows the system language (in Git Bash and WSL — the Windows"
     echo "  language). Menu item 8 \"Language / Язык\" changes it and remembers the choice;"
     echo "  the DEDUP_LANG=ru or en variable works too."
+    echo "  First start on Windows: double-click dedup_tool_first_windows_start.bat next"
+    echo "  to the script. It finds Git for Windows (if it is missing, offers to install it)"
+    echo "  and runs the script in its folder. After that this file is not needed: a double"
+    echo "  click on the script in Explorer works too."
     echo
     echo -e "${GREEN}─── Menu ───────────────────────────────────────────────────${NC}"
     echo "  1  Full processing: preparation → sort → comparison with references"
@@ -887,6 +896,9 @@ show_help_en() {
     echo "  empty folder is deleted too. Merging (item 5) does not need references."
     echo
     echo -e "${GREEN}─── Big dictionaries (gigabytes) ──────────────────────────${NC}"
+    echo "  Git Bash or WSL: dictionaries up to about 1 GB are fine in Git Bash, right on"
+    echo "  Windows (it depends on the PC). Bigger ones are better in WSL: the same work"
+    echo "  runs there 3–4 times faster."
     echo "  During long steps — copying to the Linux folder and back, sorting a"
     echo "  reference, the pass, merging — the bottom line shows every 5 s how much"
     echo "  time has passed and how much is done: the script is not stuck."
