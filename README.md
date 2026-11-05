@@ -44,7 +44,10 @@ A typical use: you collect password or login dictionaries from different sources
 git clone https://github.com/edik44/dedup_tool.git
 cd dedup_tool
 chmod +x dedup_tool.sh
+./dedup_tool.sh --help
 ```
+
+In Linux and WSL keep the `./` in front of the name: the current folder is not in `PATH`, and without it you get `command not found`.
 
 Or download only `dedup_tool.sh` and put it next to your dictionaries.
 

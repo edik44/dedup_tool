@@ -44,7 +44,10 @@
 git clone https://github.com/edik44/dedup_tool.git
 cd dedup_tool
 chmod +x dedup_tool.sh
+./dedup_tool.sh --help
 ```
+
+В Linux и WSL `./` перед именем обязателен: текущей папки нет в `PATH`, и без него будет `command not found`.
 
 Или скачайте только `dedup_tool.sh` и положите рядом со словарями.
 
