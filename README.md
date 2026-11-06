@@ -13,13 +13,16 @@ A typical use: you collect password or login dictionaries from different sources
   - UTF-16 → UTF-8 (by the BOM or by null bytes);
   - single-byte Cyrillic (Windows-1251, KOI8-R, CP866) is recognized automatically; a mixed file is converted line by line, and its UTF-8 lines are left alone;
   - CRLF and BOM, also an invisible U+FEFF inside lines;
+  - a CR inside a line: editors show it as a line break, so one line looks like two; such lines are split;
   - words written in UTF-16 inside a UTF-8 file (a NUL after each letter);
-  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251;
+  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251, Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs);
   - invalid UTF-8, the replacement character U+FFFD, control characters;
+  - empty lines and lines of only spaces or tabs;
   - length and digits-only filters; the removed short lines and digit lines can be saved to `<name>_short.txt` and `<name>_digits.txt`.
 - **References** live in `Compare Files/`. Each file is one "generation" of the comparison, in name order. They are checked (CRLF/BOM, order, duplicates) and fixed only with your consent.
 - **Queue.** Several dictionaries in a row: each is cleaned of the references and of the results of all previous ones, so the results never overlap.
 - **Merge** results into one file, **split** a file into parts.
+- **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links and IPs out of a dump, keyboard layout RU ↔ EN, case, spaces, removing lines by a piece, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries.
 - **WSL.** If the files are on a Windows drive (`/mnt/c`, `/mnt/d`), the script offers to work in a Linux temp folder: line-by-line writing through the WSL bridge is hundreds of times slower.
 - Progress on long steps, a log of every action, statistics per step. It also notices an archive renamed to `.txt`, a working file that is a copy of a reference, and result lines with spaces at the edges.
 
@@ -75,8 +78,9 @@ Run `./dedup_tool.sh` (on Windows — a double click on it; the very first time 
   4) Several dictionaries in a queue: each is also cleaned of the previous ones → _final for each
   5) Merge _final results into one file → merged.txt and the list of files merged_list.txt
   6) Split a finished file into parts
-  7) Help
+  7) Dictionary tools: logins, keyboard layout, case, alphabets, search…
   8) Language / Язык: English
+  9) Help
   0) Exit
 ```
 
@@ -94,6 +98,44 @@ The script never changes your working files; after a queue it moves them to `ori
 ```
 
 `split` also takes a part size: `500M`, `2G`. The answers can be given through stdin, for example `printf 'y\nn\nn\n' | ./dedup_tool.sh full raw.txt`; with `</dev/null` every question takes its default.
+
+### Dictionary tools
+
+Menu item 7. The source file stays unchanged, the result is a new file `<name>_<what>.txt` (if the name is taken — `_2`). Logins, passwords, line parts and addresses come without duplicates in byte order; the rest line for line, in the same order.
+
+| # | What it does | Result |
+|---|---|---|
+| 1 | Emails → logins: the part before `@` | `_logins` |
+| 2 | `user:pass` → logins and passwords, split at the first `:` or `;` | `_logins`, `_passwords` |
+| 3 | Any separator (`:` `/` `;` `---` `(at)`): left and right part | `_left`, `_right` |
+| 4 | Cut emails, links and IP addresses out of a dump | `_emails`, `_urls`, `_ip` |
+| 5 | Keyboard layout: `привет` → `ghbdtn` and back | `_en`, `_ru` |
+| 6 | Case: all lower, all upper, first letter upper or lower | `_lower`, `_upper`, `_cap`, `_uncap` |
+| 7 | Lines with a space: remove them or keep only the first word | `_nospace`, `_firstword` |
+| 8 | Trim spaces and tabs at the edges, double ones inside into one | `_trim` |
+| 9 | Remove lines with the given pieces (`- _ admin`) | `_filtered` |
+| 10 | Split by alphabets; several alphabets in a line — `_mixed` | `_latin`, `_cyr`, `_greek`, `_hebrew`, `_arabic`, `_cjk`, `_other`, `_mixed` |
+| 11 | The most frequent lines: how many times and, for several files, in how many | `_top` |
+| 12 | Remove duplicates without sorting, the order of lines kept | `_uniq` |
+| 13 | Find a line in the dictionaries of the folder and in references: where and how many times | screen and log |
+
+Without the menu:
+
+```bash
+./dedup_tool.sh tool logins words.txt
+./dedup_tool.sh tool userpass dump.txt
+./dedup_tool.sh tool cut dump.txt '---' left
+./dedup_tool.sh tool extract dump.txt emails ip
+./dedup_tool.sh tool layout words.txt ru2en
+./dedup_tool.sh tool case words.txt lower
+./dedup_tool.sh tool spaces words.txt first
+./dedup_tool.sh tool trim words.txt
+./dedup_tool.sh tool filter words.txt - _ admin
+./dedup_tool.sh tool alphabets words.txt
+./dedup_tool.sh tool top 100 a.txt b.txt
+./dedup_tool.sh tool uniq words.txt
+./dedup_tool.sh tool find secret
+```
 
 ### Language
 
@@ -131,4 +173,4 @@ The core job — removing the lines that are in other files — is also done by 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Free for any use, including at work and inside a company. Selling the script or programs based on it, charging for a service built on it, and collecting donations for them are not allowed without the author's written permission. The exact terms are in [LICENSE](LICENSE). Versions 1.0.0 and 1.1.0 were released under the MIT License.

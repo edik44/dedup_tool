@@ -1,21 +1,80 @@
-MIT License
+dedup_tool License
 
 Copyright (c) 2026 edik44
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license applies to dedup_tool 1.2.0 and later. Versions 1.0.0 and 1.1.0
+were released under the MIT License, and this license does not change that.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. What you may do. Free of charge, you may use, copy, modify and share this
+   software and works based on it, for any purpose, including at work and
+   inside a company. Files you process with the software are yours and are not
+   covered by this license.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. What you may not do without written permission from the copyright holder:
+
+   a) sell the software or a work based on it, or sell access to them;
+   b) charge for a service whose main purpose is to give others what the
+      software does, such as a paid website, bot or hosted version. Using the
+      software as a tool in your own paid work is allowed;
+   c) ask for or accept donations, subscriptions or any other payment for the
+      software, for a work based on it, or for sharing them.
+
+   A work based on the software is anything that contains a substantial part
+   of its code or is a changed version of it. These limits do not apply to the
+   copyright holder.
+
+3. Conditions. Keep the copyright notice above and this license in every copy
+   and in every work based on the software. Share works based on the software
+   under this same license.
+
+4. Ending. If you break these terms, your rights under this license end
+   automatically.
+
+5. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+   EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+   OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Перевод на русский. Если тексты расходятся, действует английский.
+
+Лицензия dedup_tool
+
+Авторское право (c) 2026 edik44
+
+Эта лицензия действует для dedup_tool 1.2.0 и новее. Версии 1.0.0 и 1.1.0 вышли
+под лицензией MIT, и эта лицензия этого не меняет.
+
+1. Что можно. Бесплатно использовать, копировать, менять и распространять эту
+   программу и работы на её основе для любых целей, в том числе на работе и в
+   компании. Файлы, которые вы обрабатываете программой, принадлежат вам, и эта
+   лицензия на них не распространяется.
+
+2. Что нельзя без письменного разрешения правообладателя:
+
+   а) продавать программу или работу на её основе либо продавать доступ к ним;
+   б) брать плату за сервис, главная цель которого — дать другим то, что делает
+      программа: платный сайт, бот, размещённая версия. Использовать программу
+      как инструмент в своей оплачиваемой работе можно;
+   в) просить или принимать донаты, подписки или иную плату за программу, за
+      работу на её основе или за их распространение.
+
+   Работа на основе программы — это всё, что содержит существенную часть её кода
+   или является её изменённой версией. На правообладателя эти ограничения не
+   распространяются.
+
+3. Условия. Сохраняйте указание авторства выше и эту лицензию в каждой копии и в
+   каждой работе на основе программы. Работы на основе программы распространяйте
+   под этой же лицензией.
+
+4. Прекращение. При нарушении этих условий права по лицензии прекращаются
+   автоматически.
+
+5. Без гарантий. Программа предоставляется «как есть», без каких-либо гарантий,
+   явных или подразумеваемых. Авторы и правообладатели не отвечают за претензии,
+   ущерб и иные последствия, связанные с программой, её использованием или иными
+   действиями с ней.
