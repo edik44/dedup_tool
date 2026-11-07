@@ -15,14 +15,14 @@ A typical use: you collect password or login dictionaries from different sources
   - CRLF and BOM, also an invisible U+FEFF inside lines;
   - a CR inside a line: editors show it as a line break, so one line looks like two; such lines are split;
   - words written in UTF-16 inside a UTF-8 file (a NUL after each letter);
-  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251, Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs);
+  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251 (`cafГ©` → `café`), Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`), Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs);
   - invalid UTF-8, the replacement character U+FFFD, control characters;
   - empty lines and lines of only spaces or tabs;
-  - length and digits-only filters; the removed short lines and digit lines can be saved to `<name>_short.txt` and `<name>_digits.txt`.
+  - length and digits-only filters; the removed short lines, digit lines and lines not in UTF-8 can be saved to `<name>_short.txt`, `<name>_digits.txt` and `<name>_notutf8.txt`.
 - **References** live in `Compare Files/`. Each file is one "generation" of the comparison, in name order. They are checked (CRLF/BOM, order, duplicates) and fixed only with your consent.
-- **Queue.** Several dictionaries in a row: each is cleaned of the references and of the results of all previous ones, so the results never overlap.
+- **Queue.** Several dictionaries in a row: each is cleaned of the references and of the results of all previous ones, so the results never overlap. The menu lists the files from the biggest to the smallest: Enter is enough, and you can still type the order.
 - **Merge** results into one file, **split** a file into parts.
-- **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links and IPs out of a dump, keyboard layout RU ↔ EN, case, spaces, removing lines by a piece, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries.
+- **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links and IPs out of a dump, keyboard layout RU ↔ EN, case, spaces, removing lines by a piece, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries, spaces at the edges of lines, removing the lines of other dictionaries.
 - **WSL.** If the files are on a Windows drive (`/mnt/c`, `/mnt/d`), the script offers to work in a Linux temp folder: line-by-line writing through the WSL bridge is hundreds of times slower.
 - Progress on long steps, a log of every action, statistics per step. It also notices an archive renamed to `.txt`, a working file that is a copy of a reference, and result lines with spaces at the edges.
 
@@ -84,7 +84,7 @@ Run `./dedup_tool.sh` (on Windows — a double click on it; the very first time 
   0) Exit
 ```
 
-The script never changes your working files; after a queue it moves them to `originals_<date-time>/`. References are fixed only after a question.
+The script does not change your working files, except tool 14 if you ask it to replace a file; after a queue it moves them to `originals_<date-time>/`. References are fixed only after a question.
 
 ### Without the menu
 
@@ -101,7 +101,7 @@ The script never changes your working files; after a queue it moves them to `ori
 
 ### Dictionary tools
 
-Menu item 7. The source file stays unchanged, the result is a new file `<name>_<what>.txt` (if the name is taken — `_2`). Logins, passwords, line parts and addresses come without duplicates in byte order; the rest line for line, in the same order.
+Menu item 7. The source file stays unchanged (except tool 14, if you ask), the result is a new file `<name>_<what>.txt` (if the name is taken — `_2`). Logins, passwords, line parts and addresses come without duplicates in byte order; the rest line for line, in the same order. After tools 1–4 you can save the dictionary without the lines something was extracted from: a line goes as a whole, the file is `_rest`.
 
 | # | What it does | Result |
 |---|---|---|
@@ -110,7 +110,7 @@ Menu item 7. The source file stays unchanged, the result is a new file `<name>_<
 | 3 | Any separator (`:` `/` `;` `---` `(at)`): left and right part | `_left`, `_right` |
 | 4 | Cut emails, links and IP addresses out of a dump | `_emails`, `_urls`, `_ip` |
 | 5 | Keyboard layout: `привет` → `ghbdtn` and back | `_en`, `_ru` |
-| 6 | Case: all lower, all upper, first letter upper or lower | `_lower`, `_upper`, `_cap`, `_uncap` |
+| 6 | Case: all lower, all upper, first letter upper or lower, or all four files at once | `_lower`, `_upper`, `_cap`, `_uncap` |
 | 7 | Lines with a space: remove them or keep only the first word | `_nospace`, `_firstword` |
 | 8 | Trim spaces and tabs at the edges, double ones inside into one | `_trim` |
 | 9 | Remove lines with the given pieces (`- _ admin`) | `_filtered` |
@@ -118,6 +118,8 @@ Menu item 7. The source file stays unchanged, the result is a new file `<name>_<
 | 11 | The most frequent lines: how many times and, for several files, in how many | `_top` |
 | 12 | Remove duplicates without sorting, the order of lines kept | `_uniq` |
 | 13 | Find a line in the dictionaries of the folder and in references: where and how many times | screen and log |
+| 14 | Spaces and tabs at the edges: move such lines out, trim on the right or left; can replace the file itself if you ask | `_edge`, `_noedge`, `_rtrim`, `_ltrim` |
+| 15 | Remove from a file the lines of other dictionaries (without `Compare Files`), sorted, without duplicates | `_minus` |
 
 Without the menu:
 
@@ -135,6 +137,8 @@ Without the menu:
 ./dedup_tool.sh tool top 100 a.txt b.txt
 ./dedup_tool.sh tool uniq words.txt
 ./dedup_tool.sh tool find secret
+./dedup_tool.sh tool edge words.txt right
+./dedup_tool.sh tool minus words.txt other.txt more.txt
 ```
 
 ### Language

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0 — 2026-11-07
+
+- **New kind of mojibake:** Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`). Only if most lines in capitals look so, and letter pair frequencies check each line; a real word in capitals is sometimes converted too, a short one more often, so the question stays yours.
+- UTF-8 of any characters read as Windows-1251 is restored too (`cafГ©` → `café`), not only Russian letters. Before, the DOS rule could turn such lines into Russian nonsense: this is fixed.
+- A line of DOS signs only (`¤®¬` → `дом`) is restored if the file already has DOS mojibake.
+- Lines not in UTF-8: if the encoding is not found, you are told how many lines the check removes before the question, and they can be saved to `<name>_notutf8.txt`.
+- Queue: the menu lists files from the biggest to the smallest, so Enter is enough; a short summary line per file; with many references the screen shows only their number, the names go to the log.
+- Lines with spaces or tabs at the edges of a result: only a count now, no question. New tool 14 moves such lines out or trims them on the right or left, and can replace the file itself if you ask.
+- New tool 15 removes from a file the lines of other dictionaries (`<name>_minus.txt`), without `Compare Files`.
+- After tools 1–4 you can save the dictionary without the lines something was extracted from (`<name>_rest.txt`). Tool 6 can make all four files at once. Tool 11 tells when the end of its list is chosen among equal counts.
+- The warning of item 3 is about ten times faster.
+- Known issues: the DOS rule can still take a line that is mostly ASCII signs; text damaged twice needs a second run of item 2; a file with several one-byte encodings at once is not recognized — give one encoding by hand, then run item 2 on the result.
+
 ## 1.2.0 — 2026-11-06
 
 - **New license from this version:** still free for any use, including at work, but selling the script or programs based on it, charging for a service built on it, and collecting donations for them are not allowed without the author's written permission. See `LICENSE`. Versions 1.0.0 and 1.1.0 stay under the MIT License.
