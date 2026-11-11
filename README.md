@@ -15,13 +15,16 @@ A typical use: you collect password or login dictionaries from different sources
   - CRLF and BOM, also an invisible U+FEFF inside lines;
   - a CR inside a line: editors show it as a line break, so one line looks like two; such lines are split;
   - words written in UTF-16 inside a UTF-8 file (a NUL after each letter);
-  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251 (`cafГ©` → `café`), Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`), Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs);
-  - invalid UTF-8, the replacement character U+FFFD, control characters;
+  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251 (`cafГ©` → `café`), Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`), Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs); text damaged twice is restored in one pass, a line cut in the middle of a letter keeps its full letters;
+  - an invisible soft hyphen (U+00AD) inside a word;
+  - invalid UTF-8, the replacement character U+FFFD, control characters; for lines not in UTF-8 you see their share of the file and what they look like (Windows-1251, KOI8-R, CP866, Western languages), and how to sort them out later;
+  - a byte the chosen encoding has no character for (98 in Windows-1251 — the letter Ш in DOS text) is not cut out of the word: you choose to keep such lines for the second step or to remove them;
   - empty lines and lines of only spaces or tabs;
   - length and digits-only filters; the removed short lines, digit lines and lines not in UTF-8 can be saved to `<name>_short.txt`, `<name>_digits.txt` and `<name>_notutf8.txt`.
 - **References** live in `Compare Files/`. Each file is one "generation" of the comparison, in name order. They are checked (CRLF/BOM, order, duplicates) and fixed only with your consent.
 - **Queue.** Several dictionaries in a row: each is cleaned of the references and of the results of all previous ones, so the results never overlap. The menu lists the files from the biggest to the smallest: Enter is enough, and you can still type the order.
-- **Merge** results into one file, **split** a file into parts.
+- **Merge** results (or all files of the folder) into one file without duplicates; every merge is added to the log `merged_list.txt`, and the merged files can be moved to `originals_<date-time>/`. **Split** a file into parts.
+- **Temp files and memory for sorting** (menu item 9): put the temporary files of `sort` on another disk — for example a removable one, to spare the system SSD when you sort tens of GB — and set its memory: automatic, a size or a share of the free memory.
 - **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links and IPs out of a dump, keyboard layout RU ↔ EN, case, spaces, removing lines by a piece, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries, spaces at the edges of lines, removing the lines of other dictionaries.
 - **WSL.** If the files are on a Windows drive (`/mnt/c`, `/mnt/d`), the script offers to work in a Linux temp folder: line-by-line writing through the WSL bridge is hundreds of times slower.
 - Progress on long steps, a log of every action, statistics per step. It also notices an archive renamed to `.txt`, a working file that is a copy of a reference, and result lines with spaces at the edges.
@@ -72,19 +75,20 @@ your_folder/
 Run `./dedup_tool.sh` (on Windows — a double click on it; the very first time — on `dedup_tool_first_windows_start.bat`) and choose an item:
 
 ```
-  1) Full processing: preparation and comparison with references → <name>_final.txt
-  2) Preparation only (encoding, CRLF/BOM, filters) → <name>_prep.txt
-  3) Comparison with references only, the file as is → <name>_final.txt
-  4) Several dictionaries in a queue: each is also cleaned of the previous ones → _final for each
-  5) Merge _final results into one file → merged.txt and the list of files merged_list.txt
+  1) Full processing: preparation, no duplicates, comparison with references → <name>_final.txt
+  2) Preparation only (encoding, CRLF/BOM, filters; duplicates stay) → <name>_prep.txt
+  3) Comparison with references and no duplicates, the file as is → <name>_final.txt
+  4) Several dictionaries in a queue, no duplicates even between them → _final for each
+  5) Merge files into one without duplicates (_final results or all) → merged.txt
   6) Split a finished file into parts
   7) Dictionary tools: logins, keyboard layout, case, alphabets, search…
   8) Language / Язык: English
-  9) Help
+  9) Temp files and memory for sorting
+ 10) Help
   0) Exit
 ```
 
-The script does not change your working files, except tool 14 if you ask it to replace a file; after a queue it moves them to `originals_<date-time>/`. References are fixed only after a question.
+The script does not change your working files, except tool 14 if you ask it to replace a file; after a queue it moves them to `originals_<date-time>/`, after a merge — only if you agree. References are fixed only after a question. When you type an answer (a folder, an encoding), the arrow keys, Home, End, paste and Tab work as usual.
 
 ### Without the menu
 
@@ -167,7 +171,7 @@ A result converted from Windows-1251 can be bigger than the source: in UTF-8 a C
 ## Big files
 
 - **Git Bash or WSL.** Dictionaries up to about 1 GB are comfortable in Git Bash, right on Windows (it depends on the PC). Bigger ones are better in WSL: the same work runs there 3–4 times faster (a 95 MB dictionary with a 48 MB reference: 12 s in Git Bash, 3.5 s in WSL).
-- **Memory.** `sort` takes up to half of the free memory and up to 8 threads; what does not fit goes into its temporary files next to the result. In WSL the Linux file cache takes the rest, so WSL looks almost full in the Task Manager — this is normal. `wsl --shutdown` returns the memory after the work.
+- **Memory.** `sort` takes up to half of the free memory and up to 8 threads; what does not fit goes into its temporary files next to the result. Menu item 9 (or `DEDUP_SORT_TMP` and `DEDUP_SORT_MEM`) moves these files to another folder or disk and sets the memory. In WSL a folder on a Windows drive (`/mnt/…`) is very slow for them — the script warns. In WSL the Linux file cache takes the rest of the memory, so WSL looks almost full in the Task Manager — this is normal. `wsl --shutdown` returns the memory after the work.
 - **Disk.** In WSL a 6.5 GB dictionary with an 8.1 GB reference means, by estimate, about 70 GB written the first time (copies to the Linux folder and back, sorting the reference, the temporary files of `sort`, the result) and about 40 GB later. You need about three times the size of the dictionaries and references together in free space. Keep big files inside Linux (`\\wsl.localhost\<distribution>\home\<user>` in Explorer) — then nothing is copied.
 - **HDD.** It works, but slower: especially copying when the dictionaries and the Linux disk are on the same HDD, and sorting big files. If you have an SSD, keep the Linux disk (`ext4.vhdx`) and the working folder there.
 

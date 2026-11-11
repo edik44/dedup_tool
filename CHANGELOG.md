@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0 — 2026-11-11
+
+- **Temp files and memory for sorting**, menu item 9: put the temporary files of `sort` into another folder or on another disk (for example a removable one) and set its memory — automatic, a size (`4G`) or a share of the free memory (`70%`). Saved like the language; also `DEDUP_SORT_TMP` and `DEDUP_SORT_MEM`. The help is now item 10.
+- Typed answers (a folder, an encoding, numbers) can be edited with the arrow keys, Home, End, paste and Tab. Before, an arrow key went into the answer as invisible bytes, and a folder with odd characters in its name could appear.
+- **Merge** (item 5): `all` takes every file of the folder, not only `_final` results; every merge is added to one log `merged_list.txt`; after it you can move the merged files to `originals_<date-time>/`.
+- The menu tells where duplicates are removed.
+- **Lines not in UTF-8:** their share of the file and what they look like (Windows-1251, KOI8-R, CP866, Western languages); if almost the whole file is not UTF-8, Enter at the encoding question asks again instead of removing everything; after `_notutf8.txt` — how to sort it out.
+- **A byte the encoding has no character for** (98 in Windows-1251 — the letter Ш in DOS text) is no longer cut out of the word silently: a count and a question — keep such lines for the second step (restoring the mojibake brings the letter back) or remove them now.
+- **Mojibake:** text damaged twice is restored in one pass; a line cut in the middle of a letter keeps its full letters; the DOS rule no longer takes lines that are mostly ASCII signs; examples show the final result of all steps, KOI8-R shows words first.
+- **Soft hyphen** (U+00AD) inside a word: a count, examples and a question. In mojibake the same character is part of a letter, such lines are not counted.
+- Examples show bytes that are not UTF-8 as `�`, so the log stays valid UTF-8.
+- Tool 10 does not copy the file when it has only one alphabet; tool 15 warns about lines not in UTF-8.
+- Known issues: Western words read as Windows-1251 (`Mьller`) and emoji in CESU-8 are not restored yet; a file with several one-byte encodings needs two runs of item 2 (the script tells how).
+
 ## 1.3.0 — 2026-11-07
 
 - **New kind of mojibake:** Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`). Only if most lines in capitals look so, and letter pair frequencies check each line; a real word in capitals is sometimes converted too, a short one more often, so the question stays yours.

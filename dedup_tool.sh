@@ -22,7 +22,7 @@ if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
 fi
 
 # Settings. DEDUP_WORK_ROOT — where the WSL temp folders go.
-VERSION="1.3.0"
+VERSION="1.4.0"
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_TIMEOUT=20
 DEFAULT_SPLIT_SIZE="2G"
@@ -110,6 +110,7 @@ trap on_interrupt INT
 declare -a RESULT_FILES=() ACTION_FILES=() WSL_RETURNED=()
 FINAL_DIR=""
 WSL_TEMP_DIR=""
+MERGE_MOVE=false
 WSL_REFS_BACK=true
 ACTION_ORIG_DIR=""
 ACTION_KIND=""
@@ -378,7 +379,14 @@ detect_utf16() {
 iconv_known() { iconv -f "$1" -t UTF-8 </dev/null >/dev/null 2>&1; }
 
 # Pipeline stages: each reads stdin and writes stdout; parameters are in P_* variables.
-_st_iconv() { iconv -f "$P_ENC" -t UTF-8 -c; }
+_st_iconv() {
+    if [[ -n "${P_HOLES:-}" ]]; then
+        ( set -o pipefail
+          LC_ALL=C sed -b -E "${HOLE_PRE[@]}" | iconv -f "$P_ENC" -t UTF-8 -c | LC_ALL=C sed -b -E "${HOLE_POST[@]}" )
+    else
+        iconv -f "$P_ENC" -t UTF-8 -c
+    fi
+}
 _st_strip() { LC_ALL=C sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//'; }
 _st_strip_all() { LC_ALL=C sed -e 's/\xEF\xBB\xBF//g' -e 's/\r$//'; }
 BOM_CHR=$'\xef\xbb\xbf'
@@ -386,7 +394,7 @@ _st_valid() { LC_ALL="$UTF8_LOCALE" grep -ax '.*'; }
 _st_fffd() { LC_ALL=C grep -av $'\xef\xbf\xbd'; }
 CTRL_RE=$'[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]'
 C1_RE=$'\xc2[\x80-\x9f]'
-_st_ctrl() { LC_ALL=C grep -av -e "$CTRL_RE" -e "$C1_RE"; }
+_st_ctrl() { LC_ALL=C grep -av -e "$CTRL_RE" -e "${P_C1_RE:-$C1_RE}"; }
 # Make control characters visible in examples: ␀…␟, ␡ and □ for U+0080–U+009F.
 ctrl_visible() {
     local -a ex=(-e 's/\r$//')
@@ -396,8 +404,30 @@ ctrl_visible() {
         printf -v e 's/\\x%02x/\\xe2\\x90\\x%02x/g' "$c" $(( 0x80 + c ))
         ex+=(-e "$e")
     done
-    LC_ALL=C sed -b "${ex[@]}" -e 's/\x7f/\xe2\x90\xa1/g' -e 's/\xc2[\x80-\x9f]/\xe2\x96\xa1/g'
+    LC_ALL=C sed -b "${ex[@]}" -e 's/\x7f/\xe2\x90\xa1/g' -e 's/\xc2[\x80-\x9f]/\xe2\x96\xa1/g' \
+        | LC_ALL=C awk -v BINMODE=3 "$BADBYTE_AWK"
 }
+BADBYTE_AWK='BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+{
+    s = $0; n = length(s); out = ""; i = 1
+    while (i <= n) {
+        c = ord[substr(s, i, 1)]
+        if (c < 128) { out = out substr(s, i, 1); i++; continue }
+        need = 0; lo = 128; hi = 191
+        if (c >= 194 && c <= 223) need = 1
+        else if (c >= 224 && c <= 239) { need = 2; if (c == 224) lo = 160; if (c == 237) hi = 159 }
+        else if (c >= 240 && c <= 244) { need = 3; if (c == 240) lo = 144; if (c == 244) hi = 143 }
+        ok = (need > 0 && i + need <= n)
+        for (k = 1; ok && k <= need; k++) {
+            d = ord[substr(s, i + k, 1)]
+            if (k == 1) { if (d < lo || d > hi) ok = 0 }
+            else if (d < 128 || d > 191) ok = 0
+        }
+        if (ok) { out = out substr(s, i, need + 1); i += need + 1 }
+        else { out = out "\357\277\275"; i++ }
+    }
+    print out
+}'
 MOJI_CONT=$'(\xc2[\x80-\xbf]|\xe2\x80[\x93\x94\x98\x99\x9a\x9c\x9d\x9e\xa0\xa1\xa2\xa6\xb0\xb9\xba]|\xe2\x82\xac|\xe2\x84\xa2|\xc5[\x92\x93\xa0\xa1\xb8\xbd\xbe]|\xc6\x92|\xcb[\x86\x9c])'
 MOJI_CHAR=$'(\xc3[\x82-\x9f]'"$MOJI_CONT"$'|\xc3[\xa0-\xaf]'"$MOJI_CONT$MOJI_CONT"$'|\xc3[\xb0-\xb4]'"$MOJI_CONT$MOJI_CONT$MOJI_CONT"')'
 MOJI_RE=$'^([\x09\x20-\x7e]|'"$MOJI_CHAR"$')+\r?$'
@@ -461,7 +491,15 @@ U8X_RE=$'^([\x09\x20-\x7e]|'"$U8X_CHAR"$')+\r?$'
 DOSP_RE=$'^('"$DOS_PUNCT"$'){3,}\r?$'
 U8X_LAT=$'\xd0[\x93-\x95]'"$W_ANY"
 U8X_G="[A-Za-z].*${U8X_LAT}|${U8X_LAT}.*[A-Za-z]|${W_80_8F}|${W_90_9F}"$'|\xc2[\xb0\xb1\xb5-\xb7\xbb]|\xd0[\x92-\xaf]\xc2[\xa0\xa4\xa6\xa7\xa9\xab-\xae]|\xd0\xbf\xd1\x97\xd0\x85'
-declare -a CYR_SED=() DOS_SEL=() U8_SEL=() DOSP_SED=()
+U8T_TWO="${U8_PAIR}.*${U8_PAIR}"
+U8T_FIX=(-e $'/\xd0[\xa0\xa1]\r?$/{' -e 'h' -e 's/\xd0[\xa0\xa1](\r?)$/\1/'
+         -e "/${U8_RE}/{" -e "/${U8T_TWO}/bt1" -e '}' -e "/${U8X_RE}/{" -e "/${U8X_G}/bt1" -e '}'
+         -e 'g' -e ':t1' -e '}')
+U8T_SEL=(-e $'/\xd0[\xa0\xa1]\r?$/{' -e 'h' -e 's/\xd0[\xa0\xa1](\r?)$/\1/'
+         -e "/${U8_RE}/{" -e "/${U8T_TWO}/{" -e 'g' -e 'p' -e 'b' -e '}' -e '}'
+         -e "/${U8X_RE}/{" -e "/${U8X_G}/{" -e 'g' -e 'p' -e 'b' -e '}' -e '}' -e 'g' -e '}')
+_st_u8t_sel() { LC_ALL=C sed -n -b -E "${U8T_SEL[@]}"; }
+declare -a CYR_SED=() CYR2_SED=() DOS_SEL=() U8_SEL=() DOSP_SED=()
 # sed program for mojibake through Windows-1251: Russian DOS text and UTF-8 (CYR_SED).
 cyr_sed_build() {
     local p h i b e hx
@@ -471,7 +509,7 @@ cyr_sed_build() {
         for (( i = 0; i < ${#h}; i += 2 )); do e+="\\x${h:i:2}"; done
         u[${p%%:*}]="$e"
     done
-    CYR_SED=(-e "/${DOS_SYM}|${U8X_START}/"'!b' -e "/${U8_RE}/"'!bx8')
+    CYR_SED=(-e "/${DOS_SYM}|${U8X_START}/"'!b' "${U8T_FIX[@]}" -e "/${U8_RE}/"'!bx8')
     for (( b = 0x90; b <= 0xbf; b++ )); do
         (( b == 0xa0 || b == 0xa1 )) && continue
         printf -v hx '%02x' "$b"
@@ -503,9 +541,13 @@ cyr_sed_build() {
           -e "/${DOS_PUNCT}/bx" -e "/${DOS_APP}/"'!bx'
           -e "/${DOS_GS}/"'!bg1' -e "/${DOS_GB}|${DOS_GU}|${DOS_GR}/bx" -e ':g1'
           -e "/${DOS_GB}/"'!bg2' -e "/${DOS_GU}|${DOS_GR}/bx" -e ':g2'
-          -e "/${DOS_GU}/"'!b' -e "/${DOS_GR}/bx" -e 'b' -e ':x')
+          -e "/${DOS_GU}/"'!b' -e "/${DOS_GR}/bx" -e 'b' -e ':x'
+          -e 'h' -e 's/[\xc2-\xf4][\x80-\xbf]+/a/g' -e 's/[ \t\r]//g' -e 's/[^a]/b/g'
+          -e ':c' -e 's/ab|ba//g' -e 'tc' -e '/^a+$/!{' -e 'g' -e 'b' -e '}' -e 'g')
     DOS_SEL=(-e "/${U8X_RE}/{" -e "/${U8X_G}/b" -e '}' "${rule[@]}" -e 'p')
-    U8_SEL=(-e "/${U8_RE}/{" -e 'p' -e 'b' -e '}' -e "/${U8X_RE}/{" -e "/${U8X_G}/p" -e '}')
+    U8_SEL=("${U8T_SEL[@]}" -e "/${U8_RE}/{" -e 'p' -e 'b' -e '}' -e "/${U8X_RE}/{" -e "/${U8X_G}/p" -e '}')
+    CYR2_SED=("${CYR_SED[@]}" -e ':d')
+    CYR2_SED[1]="/${U8_PAIR}|${U8X_START}/!b"
     CYR_SED+=(-e ':d' "${rule[@]}")
     for (( i = 0; i < 16; i++ )); do
         printf -v e 's/\\xd0\\x%02x/\\xd1\\x%02x/g' $(( 0xb0 + i )) $(( 0x80 + i ))
@@ -521,6 +563,13 @@ cyr_sed_build() {
 }
 cyr_sed_build
 _st_cyr() { LC_ALL=C sed -b -E "${CYR_SED[@]}"; }
+_st_cyr2() { LC_ALL=C sed -b -E "${CYR2_SED[@]}"; }
+SHY_OTHER=$'(\xc2[\x98\xa0\xa4\xa6\xa7\xa9\xab\xac\xae]|\xe2\x80[\x93\x94\x98-\x9a\x9c-\x9e\xa0-\xa2\xa6\xb0\xb9\xba]|\xe2\x82\xac|\xe2\x84\xa2|'"${DOS_GS}|${DOS_GB}|${DOS_GU}"')'
+SHY_L=$'([A-Za-z]|\xd0[\x81\x90-\xbf]|\xd1[\x80-\x8f\x91])'
+SHY_LL=$'([A-Za-z]|\xd0[\x81\x90\x91\xb0-\xbf]|\xd1[\x80-\x8f\x91])'
+SHY_RE="${SHY_LL}"$'\xc2\xad'"${SHY_L}"
+_st_shy() { LC_ALL=C sed -b -E -e "/${SHY_OTHER}/b" -e ':a' -e "s/${SHY_LL}"$'\xc2\xad'"${SHY_L}/\\1\\2/" -e 'ta'; }
+_shy_sel() { LC_ALL=C grep -a -E "$SHY_RE" | LC_ALL=C grep -a -v -E "$SHY_OTHER"; }
 _st_dos_sel() { LC_ALL=C sed -n -b -E "${DOS_SEL[@]}"; }
 _st_u8_sel() { LC_ALL=C sed -n -b -E "${U8_SEL[@]}"; }
 _st_dosp() { LC_ALL=C sed -b -E "${DOSP_SED[@]}"; }
@@ -602,7 +651,13 @@ detect_koi() {
     KOI_ALL=$vote; KOI_REST=$(( cand - vote ))
     return 0
 }
-_st_unmoji() { _st_moji | _st_cyr | { if (( ${dosp_all:-0} > 0 )); then _st_dosp; else cat; fi; } | { if (( ${s7_all:-0} > 0 )); then _st_s7; else cat; fi; }; }
+_st_unmoji() {
+    _st_moji | _st_cyr \
+        | { if (( ${moji_all:-0} + ${u8_all:-0} > 0 )); then _st_moji | _st_cyr2; else cat; fi; } \
+        | { if (( ${dosp_all:-0} > 0 )); then _st_dosp; else cat; fi; } \
+        | { if (( ${koi_all:-0} > 0 )); then _st_koi; else cat; fi; } \
+        | { if (( ${s7_all:-0} > 0 )); then _st_s7; else cat; fi; }
+}
 S7_SET='\x00-\x09\x0b-\x2f\x60-\x6f\x71'
 S7_LINE_RE='^(?!\r?$)[\x00-\x09\x0b-\x2f\x60-\x6f\x71]+$'
 declare -a S7_SED=()
@@ -629,9 +684,14 @@ BLANK_RE='^[ \t]*\r?$'
 _st_blank() { LC_ALL=C grep -a -U -v -P "$BLANK_RE"; }
 # Up to three "before → after" examples of restored lines.
 moji_examples() {
-    local fix="$1" first="${2:-}" cand raw="" mi
+    local fix="$1" first="${2:-}" last="${3:-}" cand raw="" mi
     local -a ex=() fx=()
-    cand="$(LC_ALL=C grep -a -m 50 -E '^.{1,60}$' | LC_ALL=C sed -b 's/\r$//')"
+    cand="$(LC_ALL=C grep -a -m 2000 -E '^.{1,60}$' | LC_ALL=C sed -b 's/\r$//')"
+    if [[ -n "$last" ]]; then
+        raw="$(LC_ALL=C grep -a -v -E "$last" <<<"$cand")"
+        [[ -n "$raw" ]] && cand="$raw"
+        raw=""
+    fi
     [[ -n "$first" ]] && raw="$(LC_ALL=C grep -a -m 3 -E "$first" <<<"$cand")"
     [[ -n "$raw" ]] || raw="$(head -n 3 <<<"$cand")"
     [[ -n "$raw" ]] || return 0
@@ -681,10 +741,11 @@ show_help_ru() {
     echo "  сам — двойным нажатием на файл в Проводнике."
     echo
     echo -e "${GREEN}─── Меню ───────────────────────────────────────────────────${NC}"
-    echo "  1  Полная обработка: подготовка → сортировка → сравнение с эталонами"
-    echo "     → <имя>_final.txt"
-    echo "  2  Только подготовка → <имя>_prep.txt (если такой уже есть — спросит:"
-    echo "     перезаписать или сохранить как <имя>_prep_2.txt, Enter — второе)"
+    echo "  1  Полная обработка: подготовка → сортировка (повторы уходят) → сравнение"
+    echo "     с эталонами → <имя>_final.txt"
+    echo "  2  Только подготовка → <имя>_prep.txt, повторы и порядок строк остаются (если"
+    echo "     такой файл уже есть — спросит: перезаписать или сохранить как"
+    echo "     <имя>_prep_2.txt, Enter — второе)"
     echo "  3  Только сравнение с эталонами (один файл или все) → <имя>_final.txt."
     echo "     Файл берётся как есть, без подготовки: мусор (NUL, U+FFFD, управляющие"
     echo "     символы), короткие строки и строки из цифр в итоге остаются. Сырой файл —"
@@ -701,13 +762,17 @@ show_help_ru() {
     echo "     эталонов может и не быть — тогда файлы чистятся только друг от друга."
     echo "     Когда очередь пройдена целиком, исходные словари уходят в новую папку"
     echo "     originals_<дата-время>/ — в рабочей папке остаются итоги."
-    echo "  5  Объединить итоги _final в один файл → merged.txt и merged_list.txt."
-    echo "     Файлы склеиваются без повторов; в merged_list.txt — из каких файлов"
-    echo "     собран merged.txt, по имени в строке. Номера через пробел, Enter — все"
-    echo "     итоги _final. Если merged.txt уже есть — merged_2.txt и т.д."
+    echo "  5  Объединить файлы в один без повторов → merged.txt (если есть — merged_2.txt"
+    echo "     и т.д.). Номера через пробел, «все» — все файлы папки, кроме списков"
+    echo "     объединения, Enter — все итоги _final. Каждое объединение дописывает в"
+    echo "     журнал merged_list.txt запись: дата, результат, строк и из каких файлов."
+    echo "     Потом вопрос: перенести объединённые файлы в originals_<дата-время>/"
+    echo "     (Enter — нет), чтобы в папке остался только результат."
     echo "  6  Разделить готовый файл на части → папка <имя>_parts/"
     echo "  7  Работа со словарями: логины, раскладка, регистр, алфавиты, поиск — см. ниже"
-    echo "  8  Язык / Language      9  Справка      0  Выход"
+    echo "  8  Язык / Language"
+    echo "  9  Временные файлы и память для сортировки — см. «Большие словари»"
+    echo "  10 Справка      0  Выход"
     echo "  Если рабочий файл — копия эталона из '$COMPARE_DIR/', скрипт предупредит до"
     echo "  вопросов: такой файл сравнится сам с собой, и его итог будет пустым."
     echo "  Если файл — архив под видом .txt (gzip, zip, 7z, rar, bzip2, xz, zstd),"
@@ -749,6 +814,9 @@ show_help_ru() {
     echo "      – русский текст в DOS (CP866) без старшего бита: «а» стала пробелом, другие"
     echo "        буквы — знаками. Узнаётся по всему файлу, а не по строке; настоящие дефис"
     echo "        и пробел станут буквами, строки с цифрами и латиницей не трогаются."
+    echo "     Текст, испорченный дважды, восстанавливается вторым кругом сразу. Строка,"
+    echo "     обрезанная посреди буквы (так бывает с названиями сетей Wi-Fi), получает"
+    echo "     полные буквы, а половина последней отбрасывается."
     echo "     Сколько строк каждого вида и примеры — до вопроса, вопрос один на все."
     echo "     Восстанавливаются только строки, целиком состоящие из таких знаков"
     echo "     (и латиницы, цифр): обычный текст и смесь не трогаются."
@@ -770,7 +838,16 @@ show_help_ru() {
     echo "     коды 01–1F (кроме таба), 7F и U+0080–U+009F."
     echo "     В редакторе это непонятные значки, в итоге они шли бы первыми."
     echo "     Сколько таких строк и примеры — до вопроса. Если кодировка не определилась,"
-    echo "     до вопроса будет сказано, сколько строк не в UTF-8 уберёт проверка."
+    echo "     до вопроса будет сказано, сколько строк не в UTF-8 уберёт проверка, какая"
+    echo "     это доля файла и на что они похожи (по выборке со всего файла). Смесь"
+    echo "     кодировок одной не перевести: их стоит сохранить в <имя>_notutf8.txt и"
+    echo "     разобрать потом — пункт 2 с WINDOWS-1251, пункт 2 на его _prep с"
+    echo "     кракозябрами, утилита 7.10. Если не в UTF-8 почти весь файл, Enter у"
+    echo "     кодировки переспросит: иначе итог был бы пустым."
+    echo "   • Мягкий перенос   [вопрос, только если найден; Enter: ДА]"
+    echo "     Невидимый знак U+00AD внутри слова (отметка места переноса): с ним слово"
+    echo "     не совпадёт с тем, что набирают. Убирается только между буквами и только"
+    echo "     в строке без других знаков: в кракозябрах DOS этот знак — буква «н»."
     echo "   • Пустые строки    [вопрос, только если найдены; Enter: ДА]"
     echo "     Пустые строки и строки из одних пробелов и табов. Строки с пробелами только"
     echo "     по краям слова не трогает: их считает проверка итога."
@@ -883,6 +960,13 @@ show_help_ru() {
     echo "  в WSL скрипт проверяет это перед копированием. Без копирования и с меньшей"
     echo "  записью — если держать большие словари и эталоны прямо в Linux (в Проводнике"
     echo "  это \\\\wsl.localhost\\<дистрибутив>\\home\\<пользователь>)."
+    echo "  Временные файлы сортировки — пункт 9 меню. Когда словарь не помещается в"
+    echo "  память, sort пишет временные файлы примерно в его размер — по умолчанию рядом"
+    echo "  с итогом. Их можно вынести в другую папку, например на съёмный диск (будет"
+    echo "  медленнее), и задать память: авто (половина доступной), размер (4G, 500M)"
+    echo "  или долю доступной (70%). Выбор запоминается; переменные DEDUP_SORT_TMP и"
+    echo "  DEDUP_SORT_MEM сильнее него. В WSL папка на диске Windows (/mnt/...) работает"
+    echo "  через мост в десятки раз медленнее — скрипт предупредит."
     echo "  HDD: работать будет, но медленнее — особенно копирование, если словари и"
     echo "  диск Linux лежат на одном HDD, и сортировка больших файлов. Если есть SSD —"
     echo "  держите на нём диск Linux (ext4.vhdx) и рабочую папку и не запускайте"
@@ -954,10 +1038,11 @@ show_help_en() {
     echo "  click on the script in Explorer works too."
     echo
     echo -e "${GREEN}─── Menu ───────────────────────────────────────────────────${NC}"
-    echo "  1  Full processing: preparation → sort → comparison with references"
-    echo "     → <name>_final.txt"
-    echo "  2  Preparation only → <name>_prep.txt (if it already exists, asks whether"
-    echo "     to overwrite it or save as <name>_prep_2.txt; Enter — the latter)"
+    echo "  1  Full processing: preparation → sort (duplicates go) → comparison with"
+    echo "     references → <name>_final.txt"
+    echo "  2  Preparation only → <name>_prep.txt, duplicates and the line order stay (if"
+    echo "     it already exists, asks whether to overwrite it or save as"
+    echo "     <name>_prep_2.txt; Enter — the latter)"
     echo "  3  Comparison with references only (one file or all) → <name>_final.txt."
     echo "     The file is taken as is, without preparation: garbage (NUL, U+FFFD,"
     echo "     control characters), short lines and digit lines stay in the result."
@@ -976,13 +1061,17 @@ show_help_en() {
     echo "     there may be no references — then the files are cleaned of each other."
     echo "     When the whole queue is done, the source dictionaries move to a new"
     echo "     folder originals_<date-time>/ — the results stay in the working folder."
-    echo "  5  Merge _final results into one file → merged.txt and merged_list.txt."
-    echo "     The files are joined without duplicates; merged_list.txt lists the files"
-    echo "     merged.txt was built from, one name per line. Numbers separated by"
-    echo "     spaces, Enter — all _final results. If merged.txt exists — merged_2.txt."
+    echo "  5  Merge files into one without duplicates → merged.txt (if it exists —"
+    echo "     merged_2.txt and so on). Numbers separated by spaces, «all» — all files"
+    echo "     of the folder except the merge lists, Enter — all _final results. Each"
+    echo "     merge appends a record to the log merged_list.txt: the date, the result,"
+    echo "     its lines and the files. Then a question: move the merged files to"
+    echo "     originals_<date-time>/ (Enter — no), so that only the result stays."
     echo "  6  Split a finished file into parts → folder <name>_parts/"
     echo "  7  Dictionary tools: logins, keyboard layout, case, alphabets, search — see below"
-    echo "  8  Language / Язык      9  Help      0  Exit"
+    echo "  8  Language / Язык"
+    echo "  9  Temp files and memory for sorting — see «Big dictionaries»"
+    echo "  10 Help      0  Exit"
     echo "  If a working file is a copy of a reference from '$COMPARE_DIR/', the script"
     echo "  warns before the questions: such a file is compared with itself, and its"
     echo "  result is empty."
@@ -1028,6 +1117,9 @@ show_help_en() {
     echo "      – Russian DOS text (CP866) without the high bit: «а» became a space, other"
     echo "        letters became signs. Detected by the whole file, not by a line; real"
     echo "        hyphens and spaces become letters, lines with digits or Latin stay as is."
+    echo "     Text spoiled twice is restored by a second round at once. A line cut in"
+    echo "     the middle of a letter (Wi-Fi network names, for example) gets its full"
+    echo "     letters, and the half of the last one is dropped."
     echo "     The count and examples of each kind come before the question, one"
     echo "     question for all. Only lines made entirely of such characters (and"
     echo "     Latin letters, digits) are restored: normal text and mixes are kept."
@@ -1050,7 +1142,16 @@ show_help_en() {
     echo "     (except tab), 7F and U+0080–U+009F. In an editor they are odd symbols,"
     echo "     and in the result they would come first."
     echo "     The count and examples come before the question. If the encoding was not"
-    echo "     found, you are told before the question how many non-UTF-8 lines it removes."
+    echo "     found, you are told before the question how many non-UTF-8 lines it removes,"
+    echo "     what share of the file they are and what they look like (a sample over the"
+    echo "     whole file). A mix of encodings cannot be converted with one: save them to"
+    echo "     <name>_notutf8.txt and sort them out later — item 2 with WINDOWS-1251,"
+    echo "     item 2 on its _prep with mojibake, tool 7.10. If almost the whole file is"
+    echo "     not UTF-8, Enter at the encoding asks again: the result would be empty."
+    echo "   • Soft hyphen      [asked only if found; Enter: YES]"
+    echo "     The invisible U+00AD inside a word (a hyphenation mark): with it the word"
+    echo "     does not match what people type. Removed only between letters and only in"
+    echo "     a line without other such signs: in DOS mojibake this sign is the letter «н»."
     echo "   • Empty lines      [asked only if found; Enter: YES]"
     echo "     Empty lines and lines of only spaces and tabs. Lines with spaces only at the"
     echo "     edges of a word stay: the check of the result counts them."
@@ -1168,6 +1269,13 @@ show_help_en() {
     echo "  the script checks it before copying. No copying and less writing — if you"
     echo "  keep big dictionaries and references right in Linux (in Explorer it is"
     echo "  \\\\wsl.localhost\\<distribution>\\home\\<user>)."
+    echo "  Sort temp files — menu item 9. When a dictionary does not fit in memory, sort"
+    echo "  writes temp files of about its size — by default next to the result. They can"
+    echo "  go to another folder, a removable drive for example (slower), and the memory"
+    echo "  can be set: auto (half of the available), a size (4G, 500M) or a share of the"
+    echo "  available memory (70%). The choice is remembered; DEDUP_SORT_TMP and"
+    echo "  DEDUP_SORT_MEM override it. In WSL a folder on a Windows drive (/mnt/...) goes"
+    echo "  through the bridge tens of times slower — the script warns about it."
     echo "  HDD: it works, but slower — especially copying when the dictionaries and"
     echo "  the Linux disk are on the same HDD, and sorting big files. If you have an"
     echo "  SSD, keep the Linux disk (ext4.vhdx) and the working folder there, and do"
@@ -1260,6 +1368,27 @@ confirm_action() {
     [[ "$ans" == y ]]
 }
 
+CTRL_IN=$'[\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f]'
+# Read a line from the keyboard: readline in a terminal (arrows, Home, End, Tab), else plain read.
+read_line() {
+    local p="$1" v rc
+    while true; do
+        if [[ -t 0 && -t 2 && -z "${DEDUP_NO_READLINE:-}" ]]; then
+            v="$(LC_ALL="${UTF8_LOCALE:-C}" "$BASH" --norc --noprofile -c 'read -e -r -p "$1" v || exit 1; printf "%s" "$v" >&3' _ "$p" 3>&1 1>&2)"; rc=$?
+        else
+            read -r -p "$p" v; rc=$?
+        fi
+        v="${v%$'\r'}"
+        if [[ "$v" =~ $CTRL_IN ]]; then
+            out "${YELLOW}В ответе есть управляющие символы (так бывает от стрелок и других клавиш) — наберите ещё раз${NC}" "${YELLOW}The answer has control characters (arrow keys and the like do this) — type it again${NC}"
+            (( rc == 0 )) && continue
+            v=""
+        fi
+        REPLY="$v"
+        return "$rc"
+    done
+}
+
 # Question with a typed answer into REPLY; remembered within a queue.
 ask_value() {
     local prompt="$1" def="${2:-}" v="" rc how="" key="v:$1" e
@@ -1273,8 +1402,9 @@ ask_value() {
         REPLY="$v"
         return 0
     fi
-    read -r -p "$prompt" v
+    read_line "$prompt"
     rc=$?
+    v="$REPLY"
     if (( rc != 0 )) && [[ -z "$v" ]]; then
         L how " (ввод закончился)" " (end of input)"
     fi
@@ -1299,19 +1429,173 @@ must_run() {
 
 declare -a SORT_OPTS=()
 SORT_MEM_KB=0
-# sort buffer (half of the available memory) and threads (up to 8) into SORT_OPTS.
+# sort buffer (half of the available memory, or the setting of menu item 9), threads (up
+# to 8) and the folder for its temp files into SORT_OPTS. $1 — the default folder.
 sort_opts() {
-    local kb n
-    kb="$(awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } END { print (a != "" ? a : f) }' /proc/meminfo 2>/dev/null)"
+    local kb n want=0 def="${1:-.}"
+    mem_avail_kb; kb="$REPLY"
     n="$(nproc 2>/dev/null || echo 4)"
     [[ "$n" =~ ^[0-9]+$ ]] || n=4
     (( n > 8 )) && n=8
     SORT_OPTS=(--parallel="$n")
     SORT_MEM_KB=0
-    if [[ "$kb" =~ ^[0-9]+$ ]] && (( kb / 2 >= 65536 )); then
-        SORT_MEM_KB=$(( kb / 2 ))
+    case "$SORT_MEM_SET" in
+        "") (( kb / 2 >= 65536 )) && want=$(( kb / 2 )) ;;
+        *%) want=$(( kb * ${SORT_MEM_SET%\%} / 100 )) ;;
+        *) mem_to_kb "$SORT_MEM_SET"; want="$REPLY" ;;
+    esac
+    if (( want >= 1024 )); then
+        SORT_MEM_KB=$want
         SORT_OPTS+=(-S "${SORT_MEM_KB}K")
     fi
+    SORT_OPTS+=(-T "${SORT_TMP_EFF:-$def}")
+}
+mem_avail_kb() {
+    REPLY="$(awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } END { print (a != "" ? a : f) }' /proc/meminfo 2>/dev/null)"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || REPLY=0
+}
+mem_to_kb() {
+    local v="$1" n u
+    n="${v%[KMGT]}"; u="${v:${#n}}"
+    case "$u" in
+        K) REPLY=$(( 10#$n )) ;;
+        M) REPLY=$(( 10#$n * 1024 )) ;;
+        G) REPLY=$(( 10#$n * 1048576 )) ;;
+        T) REPLY=$(( 10#$n * 1073741824 )) ;;
+        *) REPLY=$(( 10#$n / 1024 )) ;;
+    esac
+}
+
+SORT_TMP_FILE="${LANG_FILE%/*}/sort_tmp"
+SORT_MEM_FILE="${LANG_FILE%/*}/sort_mem"
+SORT_TMP_SET=""; SORT_MEM_SET=""; SORT_TMP_EFF=""
+# Parse a memory setting: auto, 70% of the available memory, or a size like 4G or 500M.
+sort_mem_parse() {
+    local v="${1//[[:space:]]/}" r
+    v="${v//Б/}"; v="${v//б/}"
+    v="${v//Г/G}"; v="${v//г/G}"; v="${v//М/M}"; v="${v//м/M}"
+    v="${v//К/K}"; v="${v//к/K}"; v="${v//Т/T}"; v="${v//т/T}"
+    case "$v" in
+        ""|auto|AUTO|Auto|авто|Авто|АВТО) REPLY=""; return 0 ;;
+    esac
+    v="${v^^}"
+    if [[ "$v" =~ ^0*([0-9]{1,2})%$ ]]; then
+        r="${BASH_REMATCH[1]}"
+        (( r >= 1 && r <= 90 )) || return 1
+        REPLY="${r}%"
+        return 0
+    fi
+    if [[ "$v" =~ ^0*([0-9]{1,7})([KMGT])B?$ ]]; then
+        r="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+        mem_to_kb "$r"
+        (( REPLY >= 1024 )) || return 1
+        REPLY="$r"
+        return 0
+    fi
+    return 1
+}
+sort_mem_text() {
+    case "$SORT_MEM_SET" in
+        "") L REPLY "авто — половина доступной" "auto — half of the available memory" ;;
+        *%) L REPLY "${SORT_MEM_SET%\%} % доступной" "${SORT_MEM_SET%\%}% of the available memory" ;;
+        *) mem_to_kb "$SORT_MEM_SET"; REPLY="$(fmt_size $(( REPLY * 1024 )))" ;;
+    esac
+}
+# A folder as typed (D:\tmp, /mnt/d/tmp, ~/tmp) → an absolute path of this system in REPLY.
+dir_norm() {
+    local p="$1" d rest
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [[ "$p" == \"*\" ]] && { p="${p#\"}"; p="${p%\"}"; }
+    [[ "$p" == \'*\' ]] && { p="${p#\'}"; p="${p%\'}"; }
+    if [[ "$p" =~ ^([A-Za-z]):([\\/].*)?$ ]]; then
+        d="${BASH_REMATCH[1],,}"; rest="${BASH_REMATCH[2]//\\//}"
+        if command -v cygpath >/dev/null 2>&1; then
+            p="$(cygpath -u -- "$p" 2>/dev/null)" || p="/${d}${rest}"
+        elif grep -qi microsoft /proc/version 2>/dev/null; then
+            p="/mnt/${d}${rest}"
+        fi
+    fi
+    [[ "$p" == "~" ]] && p="$HOME"
+    [[ "$p" == "~/"* ]] && p="$HOME/${p#\~/}"
+    [[ "$p" == /* ]] || p="$(pwd)/$p"
+    while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done
+    REPLY="$p"
+}
+disp_dir() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
+    else printf '%s' "$1"; fi
+}
+dir_free() {
+    REPLY="$(df -Pk -- "$1" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] && REPLY=$(( REPLY * 1024 )) || REPLY=0
+}
+dir_on_wsl_mnt() {
+    grep -qi microsoft /proc/version 2>/dev/null && [[ "$1" == /mnt/[a-z] || "$1" == /mnt/[a-z]/* ]]
+}
+# Load the sort settings: DEDUP_SORT_TMP / DEDUP_SORT_MEM, else the files of menu item 9.
+sort_cfg_load() {
+    local v=""
+    SORT_TMP_SET=""; SORT_MEM_SET=""
+    if [[ -n "${DEDUP_SORT_TMP+x}" ]]; then v="$DEDUP_SORT_TMP"
+    elif [[ -r "$SORT_TMP_FILE" ]]; then IFS= read -r v < "$SORT_TMP_FILE"; fi
+    v="${v%$'\r'}"
+    if [[ "$v" =~ $CTRL_IN ]]; then
+        out "${YELLOW}⚠ Папка для временных файлов сортировки записана с управляющими символами — беру рядом с итогом. Задайте её заново: пункт 9${NC}" "${YELLOW}⚠ The folder for the sort temp files is saved with control characters — using next to the result. Set it again: item 9${NC}" >&2
+        v=""
+    fi
+    if [[ -n "$v" ]]; then dir_norm "$v"; SORT_TMP_SET="$REPLY"; fi
+    v=""
+    if [[ -n "${DEDUP_SORT_MEM+x}" ]]; then v="$DEDUP_SORT_MEM"
+    elif [[ -r "$SORT_MEM_FILE" ]]; then IFS= read -r v < "$SORT_MEM_FILE"; fi
+    v="${v%$'\r'}"
+    if sort_mem_parse "$v"; then
+        SORT_MEM_SET="$REPLY"
+    else
+        out "${YELLOW}⚠ Память для сортировки «${v}» не понял — беру авто (половина доступной)${NC}" "${YELLOW}⚠ Could not understand the sort memory «${v}» — using auto (half of the available memory)${NC}" >&2
+    fi
+}
+# Before an action: check the folder of menu item 9 and show the sort settings.
+sort_tmp_prepare() {
+    local d="$SORT_TMP_SET" t f sz=0 m tx
+    SORT_TMP_EFF=""
+    if [[ -n "$d" ]]; then
+        if [[ ! -d "$d" ]]; then
+            say "${YELLOW}⚠ Папки для временных файлов сортировки нет: $(disp_dir "$d") — они будут рядом с итогом${NC}" "${YELLOW}⚠ The folder for the sort temp files does not exist: $(disp_dir "$d") — they go next to the result${NC}"
+        elif ! t="$(mktemp "$d/.dedup_tool.XXXXXX" 2>/dev/null)"; then
+            say "${YELLOW}⚠ В папку для временных файлов сортировки нельзя писать: $(disp_dir "$d") — они будут рядом с итогом${NC}" "${YELLOW}⚠ Cannot write to the folder for the sort temp files: $(disp_dir "$d") — they go next to the result${NC}"
+        else
+            rm -f -- "$t"
+            SORT_TMP_EFF="$d"
+        fi
+    fi
+    [[ -n "$SORT_TMP_EFF" || -n "$SORT_MEM_SET" ]] || return 0
+    sort_mem_text; m="$REPLY"
+    if [[ -n "$SORT_TMP_EFF" ]]; then
+        dir_free "$SORT_TMP_EFF"
+        tx="$(disp_dir "$SORT_TMP_EFF")"
+        say "Сортировка (пункт 9): временные файлы — ${tx} (свободно $(fmt_size "$REPLY")), память — ${m}" "Sorting (item 9): temp files — ${tx} ($(fmt_size "$REPLY") free), memory — ${m}"
+        for f in "$@"; do [[ -f "$f" ]] && sz=$(( sz + $(file_size "$f") )); done
+        if (( REPLY > 0 && REPLY < sz )); then
+            say "${YELLOW}⚠ Там свободно $(fmt_size "$REPLY"), а словари — $(fmt_size "$sz"): если они не влезут в память, sort может не хватить места${NC}" "${YELLOW}⚠ It has $(fmt_size "$REPLY") free and the dictionaries take $(fmt_size "$sz"): if they do not fit in memory, sort may run out of space${NC}"
+        fi
+        if dir_on_wsl_mnt "$SORT_TMP_EFF"; then
+            say "${YELLOW}⚠ Это диск Windows: из WSL временные файлы sort пишутся через мост в десятки раз медленнее${NC}" "${YELLOW}⚠ This is a Windows drive: from WSL the sort temp files go through the bridge tens of times slower${NC}"
+        fi
+    else
+        say "Сортировка (пункт 9): временные файлы — рядом с итогом, память — ${m}" "Sorting (item 9): temp files — next to the result, memory — ${m}"
+    fi
+}
+sort_step_text() {
+    local t
+    local p=""
+    if (( SORT_MEM_KB > 0 )); then L p "память до $(fmt_size $(( SORT_MEM_KB * 1024 )))" "memory up to $(fmt_size $(( SORT_MEM_KB * 1024 )))"; fi
+    if [[ -n "$SORT_TMP_EFF" ]]; then
+        [[ -n "$p" ]] && p+=", "
+        L t "временные файлы — " "temp files — "
+        p+="${t}$(disp_dir "$SORT_TMP_EFF")"
+    fi
+    L REPLY "сортировка" "sort"
+    [[ -n "$p" ]] && REPLY+=" (${p})"
 }
 
 # Check a reference: CRLF/BOM, order, duplicates; fix with consent. Prints the path to use.
@@ -1387,15 +1671,15 @@ process_file() {
 
     tmp="$(mktemp "${dir}/.dedup_tool.XXXXXX")" || { say "   └─ Не удалось создать временный файл" "   └─ Could not create a temporary file" >&2; return 1; }
     IN_PROGRESS=("$tmp")
-    sort_opts
+    sort_opts "$dir"
     ms_now; t0=$REPLY
     L q "сортировка ${file##*/}" "sorting ${file##*/}"
     progress_start "$q" "$fsz" read "$file"
     if $strip; then
-        _st_strip < "$file" | LC_ALL=C sort -u -T "$dir" "${SORT_OPTS[@]}" > "$tmp"
+        _st_strip < "$file" | LC_ALL=C sort -u "${SORT_OPTS[@]}" > "$tmp"
         st=("${PIPESTATUS[@]}")
     else
-        LC_ALL=C sort -u -T "$dir" "${SORT_OPTS[@]}" "$file" > "$tmp"
+        LC_ALL=C sort -u "${SORT_OPTS[@]}" "$file" > "$tmp"
         st=("$?")
     fi
     progress_stop
@@ -1513,7 +1797,8 @@ pick_prep_name() {
 # Examples of lines with spaces or tabs at the edges (· is a space, → a tab).
 edge_examples() {
     { LC_ALL=C grep -a -m 3 -E "$2" -- "$1"; LC_ALL=C grep -a -m 3 -E "$3" -- "$1"; } \
-        | tr -d '\000-\010\013-\037\177' | awk '!seen[$0]++' | LC_ALL=C sed -e 's/ /·/g' -e 's/\t/→/g'
+        | tr -d '\000-\010\013-\037\177' | awk '!seen[$0]++' | LC_ALL=C sed -e 's/ /·/g' -e 's/\t/→/g' \
+        | LC_ALL=C awk -v BINMODE=3 "$BADBYTE_AWK"
 }
 
 # After the result: lines with spaces or tabs at the edges — only the count, examples in the log.
@@ -1551,10 +1836,11 @@ compare_warn() {
     LC_ALL=C grep -a -c -e "$CTRL_RE" -e "$C1_RE" -- "$f" > "$d/ctrl" 2>/dev/null & pids+=($!)
     LC_ALL=C grep -a -U -c "${CR_CHR}." -- "$f" > "$d/cr" 2>/dev/null & pids+=($!)
     LC_ALL=C grep -a -U -c -E "$BLANK_ERE" -- "$f" > "$d/blank" 2>/dev/null & pids+=($!)
+    { LC_ALL=C grep -a -E $'\xc2\xad' -- "$f" | _shy_sel | LC_ALL=C grep -a -c '' > "$d/shy"; } 2>/dev/null & pids+=($!)
     COUNTER_PIDS=("${pids[@]}")
     wait "${pids[@]}" 2>/dev/null
     COUNTER_PIDS=()
-    for k in bad nul fffd ctrl cr blank; do
+    for k in bad nul fffd ctrl cr blank shy; do
         n=""
         [[ -f "$d/$k" ]] && read -r n < "$d/$k"
         [[ "$n" =~ ^[1-9][0-9]*$ ]] || continue
@@ -1565,6 +1851,7 @@ compare_warn() {
             ctrl)  L t ", с управляющими символами — $(fmt_num "$n")" ", with control characters: $(fmt_num "$n")" ;;
             cr)    L t ", с символом CR внутри строки — $(fmt_num "$n")" ", with a CR inside the line: $(fmt_num "$n")" ;;
             blank) L t ", пустых или из одних пробелов — $(fmt_num "$n")" ", empty or only spaces: $(fmt_num "$n")" ;;
+            shy)   L t ", с мягким переносом внутри слова — $(fmt_num "$n")" ", with a soft hyphen inside a word: $(fmt_num "$n")" ;;
         esac
         parts+="$t"
     done
@@ -1584,6 +1871,86 @@ declare -A RU_FREQ=([о]=110 [е]=85 [а]=80 [и]=74 [н]=67 [т]=63 [с]=55 [р
     [Ж]=9 [Ш]=7 [Ю]=6 [Ц]=5 [Щ]=4 [Э]=3 [Ф]=3)
 D8_ENC=""; D8_BAD=0; D8_HI=0
 declare -a D8_EX=()
+
+D8_MIX_AWK='
+BEGIN {
+    for (i = 128; i < 256; i++) { ORD[sprintf("%c", i)] = i; M1[i] = -1; M2[i] = -1; M3[i] = -1 }
+    for (i = 0; i < 1089; i++) T[i] = substr(bi, i + 1, 1) + 0
+    for (i = 0; i < 32; i++) { M1[192 + i] = i; M1[224 + i] = i }
+    M1[168] = 32; M1[184] = 32
+    split("30 0 1 22 4 5 20 3 21 8 9 10 11 12 13 14 15 31 16 17 18 19 6 2 28 27 7 24 29 25 23 26", k, " ")
+    for (i = 0; i < 32; i++) { M2[192 + i] = k[i + 1]; M2[224 + i] = k[i + 1] }
+    M2[163] = 32; M2[179] = 32
+    for (i = 0; i < 32; i++) M3[128 + i] = i
+    for (i = 0; i < 16; i++) { M3[160 + i] = i; M3[224 + i] = 16 + i }
+    M3[240] = 32; M3[241] = 32
+}
+NR % step != 0 { next }
+{
+    s = $0; if (substr(s, length(s)) == "\r") s = substr(s, 1, length(s) - 1)
+    N++; n = length(s); hi = 0
+    for (i = 1; i <= n; i++) { b = ORD[substr(s, i, 1)]; B[i] = b; if (b >= 128) hi++ }
+    if (hi == 0) { other++; next }
+    if (hi * 3 <= n) { west++; next }
+    for (e = 1; e <= 3; e++) { ok[e] = 1; sc[e] = 0; pr[e] = 0; pv[e] = -1 }
+    for (i = 1; i <= n; i++) {
+        b = B[i]
+        if (b < 128) { pv[1] = pv[2] = pv[3] = -1; continue }
+        x[1] = M1[b]; x[2] = M2[b]; x[3] = M3[b]
+        for (e = 1; e <= 3; e++) {
+            if (x[e] < 0) { ok[e] = 0; pv[e] = -1; continue }
+            if (pv[e] >= 0) { sc[e] += T[pv[e] * 33 + x[e]]; pr[e]++ }
+            pv[e] = x[e]
+        }
+    }
+    best = 0; ba = -1; sa = -1; any = 0
+    for (e = 1; e <= 3; e++) {
+        if (!ok[e]) continue
+        any = 1
+        if (pr[e] == 0) continue
+        a = sc[e] / pr[e]
+        if (a > ba) { sa = ba; ba = a; best = e } else if (a > sa) sa = a
+    }
+    if (!any) { other++; next }
+    if (best == 0) { unsure++; next }
+    if (ba < 4) { other++; next }
+    if (sa >= 0 && ba - sa < 0.5) { unsure++; next }
+    C[best]++
+}
+END { printf "%d %d %d %d %d %d %d\n", C[1], C[2], C[3], west, other, unsure, N }
+'
+# Lines not in UTF-8: what they look like (a sample over the whole file) — a message.
+bad_utf8_mix() {
+    local f="$1" bad="$2" step w k c west other unsure n s="" se="" p top=0 topn=""
+    step=$(( bad / 20000 + 1 ))
+    read -r w k c west other unsure n < <(LC_ALL="$UTF8_LOCALE" grep -a -v -x '.*' -- "$f" 2>/dev/null \
+        | LC_ALL=C awk -v BINMODE=3 -v step="$step" -v bi="$KOI_BI" "$D8_MIX_AWK")
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 30 )) || return 0
+    _mix_part() {
+        (( $1 > 0 )) || return 0
+        p=$(( ($1 * 100 + n / 2) / n ))
+        if (( p == 0 )); then p="< 1"; fi
+        [[ -n "$s" ]] && { s+=", "; se+=", "; }
+        s+="$2 — ${p} %"; se+="$3 — ${p}%"
+    }
+    _mix_part "$c" CP866 CP866
+    _mix_part "$k" KOI8-R KOI8-R
+    _mix_part "$w" WINDOWS-1251 WINDOWS-1251
+    _mix_part "$west" "западные языки (мало старших байтов)" "Western languages (few high bytes)"
+    _mix_part "$other" "не похоже на русский" "not like Russian"
+    _mix_part "$unsure" "не отличить" "cannot tell"
+    unset -f _mix_part
+    say "  Из чего они (выборка $(fmt_num "$n") строк по всему файлу): ${s}" "  What they are (a sample of $(fmt_num "$n") lines over the whole file): ${se}"
+    for p in "$w WINDOWS-1251" "$k KOI8-R" "$c CP866"; do
+        if (( ${p%% *} > top )); then top=${p%% *}; topn="${p#* }"; fi
+    done
+    if (( top * 10 >= n * 8 )); then
+        say "  Больше всего похожи на ${topn}: её можно указать на вопросе о кодировке" "  Most of them look like ${topn}: you can type it at the encoding question"
+    else
+        say "  Это смесь: одну кодировку для всех не подставить, а Enter на вопросе о кодировке их уберёт." "  It is a mix: one encoding does not fit them all, and Enter at the encoding question removes them."
+        say "  Их можно сохранить отдельным файлом (вопрос ниже): итогу это не мешает, разобрать их можно потом" "  You can save them to a separate file (a later question): the result is not affected, and they can be sorted out later"
+    fi
+}
 # Lines not in UTF-8: guess WINDOWS-1251, KOI8-R or CP866 by Russian letter frequencies.
 detect_8bit() {
     local f="$1" e s n_all w cnt ch best="" bs=0 second=0 sample
@@ -1660,11 +2027,94 @@ mix_sed_build() {
     MIX_SED=(-e $'/\x01/b' -e "/${MIX_BAD}/"'!b' -e 's/[\x80-\xff]/\x01&/g')
     for (( b = 0x80; b <= 0xff; b++ )); do
         i=$(( b - 0x80 ))
-        [[ -n "${u[i]}" ]] || u[i]='\xef\xbf\xbd'
+        if [[ -z "${u[i]}" ]]; then
+            if (( b <= 0x9f )); then printf -v hx '\\xc2\\x%02x' "$b"; u[i]="$hx"; else u[i]='\xef\xbf\xbd'; fi
+        fi
         printf -v e 's/\\x01\\x%02x/%s/g' "$b" "${u[i]}"; MIX_SED+=(-e "$e")
     done
 }
 _st_mix() { LC_ALL=C sed -b -E "${MIX_SED[@]}"; }
+
+ENC_HOLES=""
+enc_holes() {
+    local enc="$1" b hx s="" tok cur="" i=0 n=0
+    local -a u=()
+    ENC_HOLES=""
+    case "${enc^^}" in UTF*|UCS*) return 0 ;; esac
+    for (( b = 0x80; b <= 0xff; b++ )); do printf -v hx '%02x' "$b"; s+="\\x${hx}\\n"; done
+    for tok in $(printf "$s" | iconv -f "$enc" -t UTF-8 -c 2>/dev/null | od -An -tx1 -v); do
+        if [[ "$tok" == 0a ]]; then u[i]="$cur"; cur=""; i=$((i + 1)); else cur+="$tok"; fi
+    done
+    (( i == 128 )) || return 0
+    for (( b = 0; b < 128; b++ )); do [[ -z "${u[b]}" ]] && n=$((n + 1)); done
+    (( n <= 32 )) || return 0
+    for (( b = 0x80; b <= 0x9f; b++ )); do
+        [[ -z "${u[b - 0x80]}" ]] || continue
+        printf -v hx '%02x' "$b"
+        ENC_HOLES+="${ENC_HOLES:+ }${hx}"
+    done
+    return 0
+}
+declare -a HOLE_PRE=() HOLE_POST=()
+hole_sed_build() {
+    local hx
+    HOLE_PRE=(-e $'/\x01|^\x02/s/^/\x02/' -e $'/^\x02/b')
+    HOLE_POST=(-e $'s/^\x02//' -e 't')
+    for hx in $1; do
+        HOLE_PRE+=(-e "s/\\x${hx}/\\x01${hx}/g")
+        HOLE_POST+=(-e "s/\\x01${hx}/\\xc2\\x${hx}/g")
+    done
+}
+hole_class() {
+    local hx b s="" keep
+    if [[ "${2:-}" == c1 ]]; then
+        for (( b = 0x80; b <= 0x9f; b++ )); do
+            printf -v keep '%02x' "$b"
+            [[ " $1 " == *" $keep "* ]] || s+="\\x${keep}"
+        done
+        if [[ -z "$s" ]]; then REPLY="$CTRL_RE"; return 0; fi
+        printf -v REPLY '%b' "\\xc2[${s}]"
+        return 0
+    fi
+    for hx in $1; do s+="\\x${hx}"; done
+    printf -v REPLY '%b' "[${s}]"
+}
+
+# Bytes the encoding has no character for (98 in WINDOWS-1251): count and ask.
+hole_ask() {
+    local enc="$1" kind="$2" cls n list cp q
+    enc_holes "$enc"
+    [[ -n "$ENC_HOLES" ]] || return 0
+    hole_class "$ENC_HOLES"; cls="$REPLY"
+    if [[ "$kind" == mix ]]; then
+        n="$(LC_ALL=C grep -a -U -E "$MIX_BAD" -- "$input" | LC_ALL=C grep -a -U -c -e "$cls")"
+    else
+        n="$(LC_ALL=C grep -a -U -c -e "$cls" -- "$input")"
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    (( n > 0 )) || return 0
+    hole_set="$ENC_HOLES"; hole_all=$n
+    list="${ENC_HOLES^^}"; list="${list// /, }"
+    local was
+    if [[ "$kind" == mix ]]; then
+        L was "раньше такая строка уходила как нечитаемая" "before, such a line was removed as unreadable"
+    else
+        L was "раньше iconv молча вырезал такой байт из строки" "before, iconv silently cut such a byte out of the line"
+    fi
+    if [[ "$ENC_HOLES" == *" "* ]]; then
+        cp="U+0080–U+009F"
+        say "${YELLOW}⚠ Строк с байтами, которых нет в ${enc} (${list}): $(fmt_num "$n") — ${was}${NC}" "${YELLOW}⚠ Lines with bytes that ${enc} has no character for (${list}): $(fmt_num "$n") — ${was}${NC}"
+    else
+        cp="U+00${list}"
+        say "${YELLOW}⚠ Строк с байтом ${list}, которого нет в ${enc}: $(fmt_num "$n") — ${was}${NC}" "${YELLOW}⚠ Lines with the byte ${list}, which ${enc} has no character for: $(fmt_num "$n") — ${was}${NC}"
+    fi
+    [[ " $ENC_HOLES " == *" 98 "* ]] && say "  Байт 98 — это буква Ш в DOS-тексте (CP866) и вторая половина буквы И в UTF-8: такие строки — кракозябры, без него слово стало бы неверным." "  Byte 98 is the letter Ш in DOS text (CP866) and the second half of И in UTF-8: such lines are mojibake, and without it the word would be wrong."
+    say "  Да — оставить на его месте невидимый знак ${cp}: пункт 2 на результате с ответом «да» на «Восстановить кракозябры» вернёт букву, а что не восстановится — уберёт." "  Yes — put the invisible character ${cp} in its place: item 2 on the result with «yes» to «Restore the mojibake» brings the letter back and removes what it cannot restore."
+    say "  Нет — убрать эти строки сейчас, как строки с управляющим символом." "  No — remove these lines now, as lines with a control character."
+    L q "Оставить такие строки для второго шага?" "Keep such lines for the second step?"
+    confirm_action "$q" y && hole_keep=true
+    return 0
+}
 
 # All preparation questions; the answers go to the local variables of prep_file.
 prep_questions() {
@@ -1772,6 +2222,7 @@ prep_questions() {
                 if confirm_action "$q" y; then
                     if mix_sed_build "$D8_ENC"; then
                         do_mix=true; mix_all=$D8_BAD; mix_enc="$D8_ENC"
+                        hole_ask "$D8_ENC" mix
                     else
                         say "${YELLOW}⚠ Не удалось собрать таблицу перевода из ${D8_ENC} — строки не в UTF-8 останутся${NC}" "${YELLOW}⚠ Could not build the ${D8_ENC} conversion table — the non-UTF-8 lines stay${NC}"
                     fi
@@ -1790,6 +2241,10 @@ prep_questions() {
         [[ "$dos_all" =~ ^[0-9]+$ ]] || dos_all=0
         u8_all="$(LC_ALL=C grep -a -E "$U8X_START" -- "$input" | _st_u8_sel | LC_ALL=C grep -a -c '')"
         [[ "$u8_all" =~ ^[0-9]+$ ]] || u8_all=0
+        if (( u8_all > 0 )); then
+            u8t_all="$(LC_ALL=C grep -a -E $'\xd0[\xa0\xa1]\r?$' -- "$input" | _st_u8t_sel | LC_ALL=C grep -a -c '')"
+            [[ "$u8t_all" =~ ^[0-9]+$ ]] || u8t_all=0
+        fi
         if (( dos_all > 0 )); then
             dosp_all="$(LC_ALL=C grep -a -E "$DOSP_RE" -- "$input" | _st_dosp_sel | LC_ALL=C grep -a -c '')"
             [[ "$dosp_all" =~ ^[0-9]+$ ]] || dosp_all=0
@@ -1801,19 +2256,20 @@ prep_questions() {
     if (( moji_all > 0 )); then
         say "${YELLOW}⚠ Строк с кракозябрами — текстом в UTF-8, который прочитали как Windows-1252: $(fmt_num "$moji_all")${NC}" "${YELLOW}⚠ Mojibake lines — UTF-8 text read as Windows-1252: $(fmt_num "$moji_all")${NC}"
         LC_ALL=C grep -a -E "$MOJI_LEAD" -- "$input" | LC_ALL=C grep -a -E "$MOJI_RE" \
-            | moji_examples _st_moji "$MOJI_CYR"
+            | moji_examples _st_unmoji "$MOJI_CYR"
     fi
     if (( dos_all > 0 )); then
         say "${YELLOW}⚠ Строк с кракозябрами — текстом в DOS-кодировке (CP866), который прочитали как Windows-1251: $(fmt_num "$dos_all")${NC}" "${YELLOW}⚠ Mojibake lines — Russian DOS text (CP866) read as Windows-1251: $(fmt_num "$dos_all")${NC}"
-        LC_ALL=C grep -a -E "$DOS_SYM" -- "$input" | _st_dos_sel | moji_examples _st_cyr
+        LC_ALL=C grep -a -E "$DOS_SYM" -- "$input" | _st_dos_sel | moji_examples _st_unmoji
     fi
     if (( u8_all > 0 )); then
         say "${YELLOW}⚠ Строк с кракозябрами — текстом в UTF-8, который прочитали как Windows-1251: $(fmt_num "$u8_all")${NC}" "${YELLOW}⚠ Mojibake lines — UTF-8 text read as Windows-1251: $(fmt_num "$u8_all")${NC}"
-        LC_ALL=C grep -a -E "$U8X_START" -- "$input" | _st_u8_sel | moji_examples _st_cyr
+        LC_ALL=C grep -a -E "$U8X_START" -- "$input" | _st_u8_sel | moji_examples _st_unmoji "" $'\xd0\xbf\xd1\x97\xd0\x85'
+        (( u8t_all > 0 )) && say "  Из них обрезаны посреди буквы: $(fmt_num "$u8t_all") — у них восстановятся полные буквы, а половина последней отбросится" "  Of them cut in the middle of a letter: $(fmt_num "$u8t_all") — their full letters are restored, and the half of the last one is dropped"
     fi
     if (( koi_all > 0 )); then
         say "${YELLOW}⚠ Строк с кракозябрами — текстом в KOI8-R, который прочитали как Windows-1251: $(fmt_num "$koi_all")${NC}" "${YELLOW}⚠ Mojibake lines — Russian KOI8-R text read as Windows-1251: $(fmt_num "$koi_all")${NC}"
-        _koi_cands "$input" | _koi_awk sel | moji_examples _st_koi
+        _koi_cands "$input" | _koi_awk sel | moji_examples _st_unmoji $'^(\xd0[\x81\x90-\xbf]|\xd1[\x80-\x8f\x91\x96]){5,}$'
         say "  Решает частота сочетаний букв: настоящее слово заглавными изредка тоже будет переведено, короткое — чаще. Если таких слов в файле много, откажитесь." "  Letter pair frequencies decide: a real word in capitals is sometimes converted too, a short one more often. If the file has many such words, say no."
         (( KOI_REST > 0 )) && say "  Ещё строк заглавными, не похожих на такой текст: $(fmt_num "$KOI_REST") — их не трогаю." "  Other lines in capitals that do not look like such text: $(fmt_num "$KOI_REST") — they stay as they are."
     fi
@@ -1833,6 +2289,23 @@ prep_questions() {
             say "${YELLOW}⚠ Кракозябры останутся: с тем же текстом в эталоне они не совпадут${NC}" "${YELLOW}⚠ The mojibake stays: it will not match the same text in a reference${NC}"
             (( s7_nul > 0 )) && { nul_all=$(( nul_all + s7_nul )); nul_left=$(( nul_left + s7_nul )); }
         fi
+    fi
+
+    local shy_src=cat
+    $do_moji && shy_src=_st_unmoji
+    if [[ -z "$enc16" ]]; then
+        shy_all="$(LC_ALL=C grep -a -E $'\xc2\xad' -- "$input" | $shy_src | _shy_sel | LC_ALL=C grep -a -c '')"
+        [[ "$shy_all" =~ ^[0-9]+$ ]] || shy_all=0
+    fi
+    if (( shy_all > 0 )); then
+        say "${YELLOW}⚠ Строк с невидимым мягким переносом (U+00AD) внутри слова: $(fmt_num "$shy_all") — с ним слово не совпадёт с тем, что набирают${NC}" "${YELLOW}⚠ Lines with an invisible soft hyphen (U+00AD) inside a word: $(fmt_num "$shy_all") — with it the word does not match what people type${NC}"
+        local -a shy_ex=()
+        mapfile -t shy_ex < <(LC_ALL=C grep -a -E $'\xc2\xad' -- "$input" | $shy_src | _shy_sel | LC_ALL=C grep -a -m 3 -E '^.{1,60}$' \
+                                | LC_ALL=C sed -b -e 's/\r$//' -e $'s/\xc2\xad/\xe2\x80\xa7/g' | ctrl_visible)
+        (( ${#shy_ex[@]} > 0 )) && say "  Например (‧ — где стоит перенос):" "  For example (‧ marks the hyphen):"
+        for l in "${shy_ex[@]}"; do say "   «${l//\\/\\\\}»"; done
+        L q "Убрать мягкий перенос из таких строк?" "Remove the soft hyphen from such lines?"
+        confirm_action "$q" y && do_shy=true
     fi
 
     if [[ -z "$enc16" ]]; then
@@ -1874,7 +2347,7 @@ prep_questions() {
                                    | { if $do_moji; then _st_unmoji | LC_ALL=C grep -a -e "$CTRL_RE" -e "$C1_RE"; else cat; fi; } \
                                    | LC_ALL=C grep -a -m 3 -E '^.{1,40}$' | ctrl_visible)
         say "${YELLOW}⚠ Строк с управляющими символами: $(fmt_num "$ctrl_all") — в редакторе это непонятные значки${NC}" "${YELLOW}⚠ Lines with control characters: $(fmt_num "$ctrl_all") — odd symbols in an editor${NC}"
-        (( ${#ctrl_ex[@]} > 0 )) && say "  Например (␁…␟, ␡ — коды 01–1F и 7F, □ — U+0080–U+009F):" "  For example (␁…␟, ␡ are codes 01–1F and 7F, □ is U+0080–U+009F):"
+        (( ${#ctrl_ex[@]} > 0 )) && say "  Например (␁…␟, ␡ — коды 01–1F и 7F, □ — U+0080–U+009F, � — байт не в UTF-8):" "  For example (␁…␟, ␡ are codes 01–1F and 7F, □ is U+0080–U+009F, � is a byte that is not UTF-8):"
         for l in "${ctrl_ex[@]}"; do
             say "   «${l//\\/\\\\}»"
         done
@@ -1891,9 +2364,17 @@ prep_questions() {
         utf8_default=y
         L enc_prompt "Если файл в другой кодировке — укажите её (например WINDOWS-1251), Enter — сконвертировать из ${enc8}: " "If the file is in another encoding, type it (for example WINDOWS-1251); Enter — convert from ${enc8}: "
     fi
+    local lines_all=0 pct
     if [[ -z "$enc16" && -z "$enc" && -z "$enc8" ]] && ! $do_mix && (( D8_BAD > 0 )); then
         bad_utf8=$D8_BAD
-        say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$bad_utf8") — проверка их уберёт. Если в них нужный текст, укажите кодировку или сохраните их отдельным файлом (вопрос ниже)${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$bad_utf8") — the check removes them. If they hold text you need, type the encoding or save them to a separate file (a later question)${NC}"
+        lines_all="$(wc -l < "$input")"
+        [[ "$lines_all" =~ ^[0-9]+$ ]] && (( lines_all >= bad_utf8 )) || lines_all=$bad_utf8
+        pct=$(( (bad_utf8 * 1000 + lines_all / 2) / lines_all ))
+        if (( pct < 10 )); then pct="< 1"; L pct "${pct}" "${pct}"
+        elif (( pct < 100 )); then L pct "$(( pct / 10 )),$(( pct % 10 ))" "$(( pct / 10 )).$(( pct % 10 ))"
+        else pct=$(( (pct + 5) / 10 )); fi
+        say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$bad_utf8") — проверка их уберёт (${pct} % файла). Если в них нужный текст, укажите кодировку или сохраните их отдельным файлом (вопрос ниже)${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$bad_utf8") — the check removes them (${pct}% of the file). If they hold text you need, type the encoding or save them to a separate file (a later question)${NC}"
+        bad_utf8_mix "$input" "$bad_utf8"
     fi
     L q "Проверить на валидность UTF-8 и убрать нечитаемые строки?" "Check for valid UTF-8 and remove unreadable lines?"
     if confirm_action "$q" "$utf8_default"; then
@@ -1910,7 +2391,14 @@ prep_questions() {
                 src="$REPLY"
                 [[ -z "$src" && -n "$enc16" ]] && src="$enc16"
                 [[ -z "$src" && -n "$enc8" ]] && src="$enc8"
-                [[ -z "$src" ]] && break
+                if [[ -z "$src" ]]; then
+                    if (( bad_utf8 > 0 && bad_utf8 * 100 >= lines_all * 99 )); then
+                        say "${YELLOW}⚠ Почти весь файл не в UTF-8 (строк: $(fmt_num "$bad_utf8") из $(fmt_num "$lines_all")): без кодировки проверка уберёт их все${NC}" "${YELLOW}⚠ Almost the whole file is not in UTF-8 ($(fmt_num "$bad_utf8") lines of $(fmt_num "$lines_all")): without an encoding the check removes them all${NC}"
+                        L q "Всё равно убрать их?" "Remove them anyway?"
+                        confirm_action "$q" n || continue
+                    fi
+                    break
+                fi
                 if iconv_known "$src"; then
                     enc="$src"
                     break
@@ -1919,6 +2407,7 @@ prep_questions() {
             done
         fi
         [[ -n "$enc" ]] && bad_utf8=0
+        [[ -n "$enc" ]] && ! $do_mix && hole_ask "$enc" enc
         [[ -z "$UTF8_LOCALE" ]] && say "${YELLOW}⚠ UTF-8 локаль не найдена — проверяю только символ-заменитель, невалидные байты не ловятся${NC}" "${YELLOW}⚠ No UTF-8 locale — only the replacement character is checked, invalid bytes are not caught${NC}"
     fi
 
@@ -2028,8 +2517,10 @@ prep_file() {
     L dig_name "любой длины" "of any length"
     local nul_all=0 nul_word=0 nul_left=0 l
     local ctrl_all=0 feff_mid=0 moji_all=0 dos_all=0 u8_all=0 do_moji=false koi_all=0 dosp_all=0 bad_utf8=0
+    local u8t_all=0 shy_all=0 do_shy=false
     local s7_all=0 s7_keep=0 s7_lat=0 s7_nul=0 s7_cr_letter=false cr_mid=0 do_crsplit=false blank_all=0 do_blank=false
     local enc8="" do_mix=false mix_all=0 mix_enc=""
+    local hole_set="" hole_all=0 hole_keep=false
     local -a nul_ex=() ctrl_ex=() cr_ex=()
     local strip_stage=_st_strip_all final="" k
     local -a P_REFS=() gen_no=()
@@ -2066,7 +2557,7 @@ prep_file() {
     $do_len && nf=$((nf + 1))
     $do_dig && nf=$((nf + 1))
     [[ "$mode" != clean ]] && nf=$((nf + 1 + ${#P_REFS[@]}))
-    if [[ -z "$enc" ]] && ! $do_mix && ! $do_strip && ! $do_nul && ! $do_moji && ! $do_crsplit && (( nf == 0 )); then
+    if [[ -z "$enc" ]] && ! $do_mix && ! $do_strip && ! $do_nul && ! $do_moji && ! $do_crsplit && ! $do_shy && (( nf == 0 )); then
         say "\n${BLUE}Делать нечего — прохода нет, дальше идёт сам файл ${input}${NC}" "\n${BLUE}Nothing to do — no pass, the file ${input} goes on as is${NC}"
         PREP_RESULT="$input"
         return 0
@@ -2114,7 +2605,7 @@ prep_file() {
         fi
     fi
     local -a P_SAVE=() save_tmp=()
-    local save_short=false save_dig=false save_bad=false
+    local save_short=false save_dig=false save_bad=false sdir
     if $do_save; then
         if [[ -z "$fdir" ]] || ! $use_counts; then
             say "${YELLOW}⚠ Без FIFO убранные строки не сохранить — они будут просто убраны${NC}" "${YELLOW}⚠ Without FIFOs the removed lines cannot be saved — they will just be removed${NC}"
@@ -2127,7 +2618,8 @@ prep_file() {
                 [[ $k == 2 ]] && ! $save_dig && continue
                 [[ $k == 3 ]] && ! $save_bad && continue
                 P_SAVE[k]="$fdir/s$k"
-                if ! mkfifo "${P_SAVE[k]}" 2>/dev/null || ! save_tmp[k]="$(mktemp "./.dedup_tool.XXXXXX" 2>/dev/null)"; then
+                sdir="."; (( k < 3 )) && sdir="${SORT_TMP_EFF:-.}"
+                if ! mkfifo "${P_SAVE[k]}" 2>/dev/null || ! save_tmp[k]="$(mktemp "${sdir}/.dedup_tool.XXXXXX" 2>/dev/null)"; then
                     say "${YELLOW}⚠ Не удалось подготовить сохранение убранных строк — они будут просто убраны${NC}" "${YELLOW}⚠ Could not prepare saving the removed lines — they will just be removed${NC}"
                     save_short=false; save_dig=false; save_bad=false
                     break
@@ -2157,10 +2649,15 @@ prep_file() {
     if $do_moji; then
         (( moji_all > 0 )) && { stages+=(_st_moji); names+=(sed); }
         (( dos_all + u8_all > 0 )) && { stages+=(_st_cyr); names+=(sed); }
+        (( moji_all + u8_all > 0 )) && { stages+=(_st_moji _st_cyr2); names+=(sed sed); }
         (( dosp_all > 0 )) && { stages+=(_st_dosp); names+=(sed); }
         (( koi_all > 0 )) && { stages+=(_st_koi); names+=(awk); }
         (( s7_all > 0 )) && { stages+=(_st_s7); names+=(sed); }
         L t "кракозябры → текст" "mojibake → text"; steps+=("$t")
+    fi
+    if $do_shy; then
+        stages+=(_st_shy); names+=(sed)
+        L t "мягкий перенос убран" "soft hyphen removed"; steps+=("$t")
     fi
     if $do_crsplit; then
         stages+=(_st_crsplit); names+=(sed)
@@ -2220,11 +2717,7 @@ prep_file() {
         fi_n=$((fi_n + 1))
         $use_counts && { stages+=("_st_count $fi_n"); names+=(tee); }
         stages+=(_st_sortu); names+=(sort)
-        if (( SORT_MEM_KB > 0 )); then
-            L t "сортировка (память до $(fmt_size $(( SORT_MEM_KB * 1024 ))))" "sort (memory up to $(fmt_size $(( SORT_MEM_KB * 1024 ))))"; steps+=("$t")
-        else
-            L t "сортировка" "sort"; steps+=("$t")
-        fi
+        sort_step_text; steps+=("$REPLY")
         L t "повторы внутри файла" "duplicates within the file"; filt+=("$t")
         for k in "${!P_REFS[@]}"; do
             fi_n=$((fi_n + 1))
@@ -2280,7 +2773,9 @@ prep_file() {
     fi
 
     local P_ENC="$enc" P_MIN="$min" P_MAX="$max" P_DIG_RE="$dig_re" P_NUL_RE="$nul_re" P_IN="$input" P_OUT="$output"
-    local P_TMP="."
+    local P_HOLES="" P_C1_RE=""
+    if [[ -n "$enc" && -n "$hole_set" ]]; then P_HOLES="$hole_set"; hole_sed_build "$hole_set"; fi
+    if $hole_keep && [[ -n "$hole_set" ]]; then hole_class "$hole_set" c1; P_C1_RE="$REPLY"; fi
     local pl="${stages[0]} < \"\$P_IN\"" t0
     for (( k = 1; k < ${#stages[@]}; k++ )); do pl+=" | ${stages[k]}"; done
     pl+=" > \"\$P_OUT\""
@@ -2324,13 +2819,28 @@ prep_file() {
     n_out=$(wc -l < "$output")
     $do_nul && L nul_line "  ↻ слова из UTF-16 восстановлены (убраны NUL): $(fmt_num "$nul_word")" "  ↻ words from UTF-16 restored (NUL removed): $(fmt_num "$nul_word")"
     $do_mix && L mix_line "  ↻ строки не в UTF-8 перекодированы из ${mix_enc}: $(fmt_num "$mix_all")" "  ↻ lines not in UTF-8 converted from ${mix_enc}: $(fmt_num "$mix_all")"
+    if $hole_keep && (( hole_all > 0 )); then
+        local hl="${hole_set^^}"; hl="${hl// /, }"
+        L t "  ↻ строк, где байт ${hl} оставлен невидимым знаком для второго шага: $(fmt_num "$hole_all") — пункт 2 на результате, «Восстановить кракозябры» — да" "  ↻ lines where the byte ${hl} is kept as an invisible character for the second step: $(fmt_num "$hole_all") — item 2 on the result, «Restore the mojibake» — yes"
+        mix_line="${mix_line:+${mix_line}\n}${t}"
+    fi
     $do_crsplit && L cr_line "  ↻ строки с CR внутри разбиты: $(fmt_num "$cr_mid")" "  ↻ lines with a CR inside split: $(fmt_num "$cr_mid")"
     [[ -z "$enc" ]] && $do_strip && (( feff_mid > 0 )) && L feff_line "  ↻ невидимый U+FEFF убран из строк: $(fmt_num "$feff_mid")" "  ↻ invisible U+FEFF removed from lines: $(fmt_num "$feff_mid")"
+    $do_shy && L feff_line "${feff_line:+${feff_line}\n}  ↻ мягкий перенос убран из строк: $(fmt_num "$shy_all")" "${feff_line:+${feff_line}\n}  ↻ soft hyphen removed from lines: $(fmt_num "$shy_all")"
     if [[ -z "$enc" ]] && $do_moji; then
         local mk="" kinds=0
         (( moji_all > 0 )) && { L t ", UTF-8 как Windows-1252 — $(fmt_num "$moji_all")" ", UTF-8 as Windows-1252: $(fmt_num "$moji_all")"; mk+="$t"; kinds=$((kinds + 1)); }
         (( dos_all > 0 )) && { L t ", DOS — $(fmt_num "$dos_all")" ", DOS: $(fmt_num "$dos_all")"; mk+="$t"; kinds=$((kinds + 1)); }
-        (( u8_all > 0 )) && { L t ", UTF-8 как Windows-1251 — $(fmt_num "$u8_all")" ", UTF-8 as Windows-1251: $(fmt_num "$u8_all")"; mk+="$t"; kinds=$((kinds + 1)); }
+        if (( u8_all > 0 )); then
+            if (( u8t_all > 0 )); then
+                L t ", UTF-8 как Windows-1251 — $(fmt_num "$u8_all"), из них обрезанных — $(fmt_num "$u8t_all")" ", UTF-8 as Windows-1251: $(fmt_num "$u8_all"), of them cut: $(fmt_num "$u8t_all")"
+                kinds=$((kinds + 2))
+            else
+                L t ", UTF-8 как Windows-1251 — $(fmt_num "$u8_all")" ", UTF-8 as Windows-1251: $(fmt_num "$u8_all")"
+                kinds=$((kinds + 1))
+            fi
+            mk+="$t"
+        fi
         (( koi_all > 0 )) && { L t ", KOI8-R как Windows-1251 — $(fmt_num "$koi_all")" ", KOI8-R as Windows-1251: $(fmt_num "$koi_all")"; mk+="$t"; kinds=$((kinds + 1)); }
         (( s7_all > 0 )) && { L t ", CP866 без старшего бита — $(fmt_num "$s7_all")" ", CP866 without the high bit: $(fmt_num "$s7_all")"; mk+="$t"; kinds=$((kinds + 2)); }
         L moji_line "  ↻ кракозябры восстановлены: $(fmt_num $(( moji_all + dos_all + u8_all + koi_all + s7_all )))" "  ↻ mojibake restored: $(fmt_num $(( moji_all + dos_all + u8_all + koi_all + s7_all )))"
@@ -2392,6 +2902,9 @@ prep_file() {
                     n_s=$(wc -l < "$sname")
                     RESULT_FILES+=("$sname")
                     say "  ⤷ ${what} — в ${sname}: $(fmt_num "$n_s") (как есть)" "  ⤷ ${what} to ${sname}: $(fmt_num "$n_s") (as they are)"
+                    say "    Разобрать потом: пункт 2 на ${sname} с кодировкой WINDOWS-1251 (на вопрос о кодировке)," "    To sort them out later: item 2 on ${sname} with the encoding WINDOWS-1251 (at the encoding question),"
+                    say "    потом пункт 2 на его _prep — «Восстановить кракозябры?» да (DOS и KOI8-R станут русскими)," "    then item 2 on its _prep — «Restore mojibake?» yes (DOS and KOI8-R become Russian),"
+                    say "    потом утилита 7.10 — по алфавитам: русское в _cyr; дальше — пункт 3 или 4" "    then tool 7.10 — by alphabet: Russian goes to _cyr; then item 3 or 4"
                 else
                     rm -f -- "$sname"
                     say "${YELLOW}⚠ Не удалось сохранить ${what} в ${sname} — итог от этого не пострадал${NC}" "${YELLOW}⚠ Could not save ${what} to ${sname} — the result is not affected${NC}"
@@ -2400,7 +2913,7 @@ prep_file() {
                 unset 'save_tmp[k]'
                 continue
             fi
-            if LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" -o "$sname" -- "${save_tmp[k]}"; then
+            if LC_ALL=C sort -u "${SORT_OPTS[@]}" -o "$sname" -- "${save_tmp[k]}"; then
                 n_s=$(wc -l < "$sname")
                 RESULT_FILES+=("$sname")
                 say "  ⤷ ${what} — в ${sname}: $(fmt_num "$n_s") (без повторов)" "  ⤷ ${what} to ${sname}: $(fmt_num "$n_s") (without duplicates)"
@@ -2438,7 +2951,7 @@ prep_file() {
     PREP_RESULT="$final"
 }
 
-_st_sortu() { LC_ALL=C sort -u -T "$P_TMP" "${SORT_OPTS[@]}"; }
+_st_sortu() { LC_ALL=C sort -u "${SORT_OPTS[@]}"; }
 _st_comm() { LC_ALL=C comm -13 -- "${P_REFS[$1]}" -; }
 _st_testfail() { cat > /dev/null; return 3; }
 
@@ -2629,11 +3142,12 @@ cmd_queue() {
     return "$rc"
 }
 
-# After a queue: move the source dictionaries to originals_<date-time>/.
+# After a queue or a merge: move the source files to originals_<date-time>/.
 move_originals() {
     local stamp dir n=2 f moved=0 t
     local -a mine=()
     for f in "$@"; do
+        is_list "$f" && continue
         [[ -f "$f" && "$(cd "$(dirname -- "$f")" && pwd -P)" == "$(pwd -P)" ]] && mine+=("$f")
     done
     (( ${#mine[@]} > 0 )) || return 0
@@ -2649,18 +3163,25 @@ move_originals() {
             say "${YELLOW}⚠ ${f} не перенесён в ${dir}/ — остался на месте${NC}" "${YELLOW}⚠ ${f} was not moved to ${dir}/ — it stays in place${NC}" >&2
         fi
     done
-    say "${GREEN}✔ Исходные словари (${moved}) перенесены в папку ${dir}/ — в рабочей папке остались итоги${NC}" "${GREEN}✔ The source dictionaries (${moved}) moved to the folder ${dir}/ — the results stay in the working folder${NC}"
+    if [[ "$ACTION_KIND" == merge ]]; then
+        say "${GREEN}✔ Объединённые файлы (${moved}) перенесены в папку ${dir}/${NC}" "${GREEN}✔ The merged files (${moved}) moved to the folder ${dir}/${NC}"
+    else
+        say "${GREEN}✔ Исходные словари (${moved}) перенесены в папку ${dir}/ — в рабочей папке остались итоги${NC}" "${GREEN}✔ The source dictionaries (${moved}) moved to the folder ${dir}/ — the results stay in the working folder${NC}"
+    fi
 }
 
-# Item 5: merge results into merged.txt without duplicates, plus merged_list.txt.
+# Item 5: merge files into merged.txt without duplicates; append to the log merged_list.txt.
 cmd_merge() {
     local -a files=("$@")
-    local f k n=2 out list total=0 n_out tmp t0 rc sorted=true t
+    local f k n=2 out list total=0 n_out tmp t0 rc sorted=true t stamp q
+    MERGE_MOVE=false
     say "${CYAN}${SCRIPT_NAME} v${VERSION} — объединение файлов: ${#files[@]}${NC}" "${CYAN}${SCRIPT_NAME} v${VERSION} — merging files: ${#files[@]}${NC}"
-    out="merged.txt"; list="merged_list.txt"
-    while [[ -e "$out" || -e "$list" ]] || { [[ -n "$FINAL_DIR" ]] && [[ -e "$FINAL_DIR/$out" || -e "$FINAL_DIR/$list" ]]; }; do
-        out="merged_${n}.txt"; list="merged_${n}_list.txt"; n=$((n + 1))
+    out="merged.txt"
+    while [[ -e "$out" ]] || { [[ -n "$FINAL_DIR" ]] && [[ -e "$FINAL_DIR/$out" ]]; }; do
+        out="merged_${n}.txt"; n=$((n + 1))
     done
+    list="merged_list.txt"
+    [[ -n "$FINAL_DIR" ]] && list="$FINAL_DIR/merged_list.txt"
     for f in "${files[@]}"; do
         k=$(wc -l < "$f")
         total=$((total + k))
@@ -2669,6 +3190,7 @@ cmd_merge() {
     done
     tmp="$(mktemp ./.dedup_tool.XXXXXX)" || { say "${RED}✘ Не удалось создать временный файл — ничего не создано${NC}" "${RED}✘ Could not create a temporary file — nothing created${NC}" >&2; return 1; }
     IN_PROGRESS=("$tmp")
+    sort_opts
     ms_now; t0=$REPLY
     local in_bytes=0
     for f in "${files[@]}"; do in_bytes=$(( in_bytes + $(file_size "$f") )); done
@@ -2676,13 +3198,12 @@ cmd_merge() {
         say "Все файлы отсортированы — слияние за один проход (sort -m)" "All files are sorted — merging in one pass (sort -m)"
         L t слияние merging
         progress_start "$t" "$in_bytes" read "${files[@]}"
-        LC_ALL=C sort -m -u -T . -- "${files[@]}" > "$tmp"; rc=$?
+        LC_ALL=C sort -m -u "${SORT_OPTS[@]}" -- "${files[@]}" > "$tmp"; rc=$?
     else
         say "Не все файлы отсортированы — общая сортировка (sort -u)" "Not all files are sorted — sorting them together (sort -u)"
-        sort_opts
         L t сортировка sorting
         progress_start "$t" "$in_bytes" read "${files[@]}"
-        LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" -- "${files[@]}" > "$tmp"; rc=$?
+        LC_ALL=C sort -u "${SORT_OPTS[@]}" -- "${files[@]}" > "$tmp"; rc=$?
     fi
     progress_stop
     if (( rc != 0 )); then
@@ -2701,22 +3222,24 @@ cmd_merge() {
     ms_now
     n_out=$(wc -l < "$out")
     RESULT_FILES+=("$out")
-    IN_PROGRESS=("$list")
-    if ! printf '%s\n' "${files[@]}" > "$list"; then
-        rm -f -- "$list"
-        IN_PROGRESS=()
-        say "${RED}✘ Не удалось записать ${list} (${out} создан)${NC}" "${RED}✘ Could not write ${list} (${out} is created)${NC}" >&2
-        return 1
-    fi
-    IN_PROGRESS=()
-    RESULT_FILES+=("$list")
     say "${GREEN}✔ Объединённый файл: ${out} — строк $(fmt_num "$n_out"), $(fmt_size "$(file_size "$out")") ($(fmt_dur $(( REPLY - t0 ))))${NC}" "${GREEN}✔ Merged file: ${out} — lines $(fmt_num "$n_out"), $(fmt_size "$(file_size "$out")") ($(fmt_dur $(( REPLY - t0 ))))${NC}"
     if (( total > n_out )); then
         say "  Повторов убрано: $(fmt_num $(( total - n_out ))) — в ${out} каждая строка один раз" "  Duplicates removed: $(fmt_num $(( total - n_out ))) — every line is in ${out} once"
     else
         say "  Повторов между файлами нет" "  No duplicates between the files"
     fi
-    say "${GREEN}✔ Список файлов: ${list}${NC}" "${GREEN}✔ List of files: ${list}${NC}"
+    printf -v stamp '%(%Y-%m-%d %H:%M:%S)T' -1
+    L t "${stamp} → ${out}, строк ${n_out}" "${stamp} → ${out}, lines ${n_out}"
+    if { printf '%s\n' "$t" "${files[@]##*/}"; echo; } >> "$list" 2>/dev/null; then
+        say "${GREEN}✔ Записано в журнал объединений: ${list##*/}${NC}" "${GREEN}✔ Added to the merge log: ${list##*/}${NC}"
+    else
+        say "${YELLOW}⚠ Не удалось дописать журнал ${list##*/} — ${out} создан${NC}" "${YELLOW}⚠ Could not append to the log ${list##*/} — ${out} is created${NC}"
+    fi
+    total=0
+    for f in "${files[@]}"; do total=$(( total + $(file_size "$f") )); done
+    L q "Перенести объединённые файлы (${#files[@]}, $(fmt_size "$total")) в папку originals_<дата-время>/? В рабочей папке останется ${out}" "Move the merged files (${#files[@]}, $(fmt_size "$total")) to the folder originals_<date-time>/? ${out} stays in the working folder"
+    confirm_action "$q" n && MERGE_MOVE=true
+    return 0
 }
 
 # Item 6: split a file into N parts or into parts of a given size.
@@ -2793,10 +3316,12 @@ TOOL_EMAIL_RE=$'[[:alnum:]._%+\x80-\xff-]+@[[:alnum:].\x80-\xff-]+\\.[[:alpha:]\
 TOOL_URL_RE=$'(https?|ftp)://[^[:space:]"\'<>:]+(:[0-9]+[^[:space:]"\'<>:]*)?|www\\.[^[:space:]"\'<>:]+'
 TOOL_IP_RE='(?<![0-9.])(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(?!\.?[0-9])'
 
-# Temporary file next to the result; the name goes to REPLY.
+# Temporary file next to the result (with "s" — in the sort temp folder); the name goes to REPLY.
 tool_tmp() {
-    if ! REPLY="$(mktemp "./.dedup_tool.XXXXXX" 2>/dev/null)"; then
-        say "${RED}✘ Не удалось создать временный файл в этой папке${NC}" "${RED}✘ Could not create a temporary file in this folder${NC}" >&2
+    local d="."
+    [[ "${1:-}" == s ]] && d="${SORT_TMP_EFF:-.}"
+    if ! REPLY="$(mktemp "${d}/.dedup_tool.XXXXXX" 2>/dev/null)"; then
+        say "${RED}✘ Не удалось создать временный файл в папке $(disp_dir "$d")${NC}" "${RED}✘ Could not create a temporary file in the folder $(disp_dir "$d")${NC}" >&2
         return 1
     fi
     IN_PROGRESS+=("$REPLY")
@@ -2845,7 +3370,7 @@ tool_finish() {
         sort_opts
         L t "сортировка" "sort"
         progress_start "$t" "$(file_size "$tmp")" read "$tmp"
-        if ! LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" -o "$name" -- "$tmp"; then
+        if ! LC_ALL=C sort -u "${SORT_OPTS[@]}" -o "$name" -- "$tmp"; then
             progress_stop
             rm -f -- "$name" "$tmp"
             tool_release "$name" "$tmp"
@@ -2877,6 +3402,32 @@ tool_utf8_warn() {
     n="$(LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "$TOOL_INPUT" 2>/dev/null)"
     [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 0
     say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$n") — буквы в них не распознаются. Сначала подготовьте файл: пункт 2${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$n") — letters in them are not recognised. Prepare the file first: item 2${NC}"
+}
+
+# Count lines not in UTF-8 in each file (in parallel) and warn: they will not match UTF-8 words.
+tool_bad_utf8_warn() {
+    [[ -n "$UTF8_LOCALE" ]] || return 0
+    local d i n s=""
+    local -a pids=() old_dirs=("${TMP_DIRS[@]}") old_pids=("${COUNTER_PIDS[@]}")
+    d="$(mktemp -d "${TMPDIR:-/tmp}/dedup_tool.XXXXXX" 2>/dev/null)" || return 0
+    TMP_DIRS+=("$d")
+    for i in $(seq 1 $#); do
+        LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "${!i}" > "$d/$i" 2>/dev/null &
+        pids+=($!)
+    done
+    COUNTER_PIDS+=("${pids[@]}")
+    wait "${pids[@]}" 2>/dev/null
+    for i in $(seq 1 $#); do
+        n=""; read -r n < "$d/$i" 2>/dev/null
+        if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+            [[ -n "$s" ]] && s+=", "
+            s+="${!i##*/} — $(fmt_num "$n")"
+        fi
+    done
+    rm -rf -- "$d"
+    TMP_DIRS=("${old_dirs[@]}"); COUNTER_PIDS=("${old_pids[@]}")
+    [[ -n "$s" ]] || return 0
+    say "${YELLOW}⚠ Строк не в UTF-8: ${s}. Сравнение побайтное: с теми же словами в UTF-8 они не совпадут. Сначала подготовьте файлы: пункт 2${NC}" "${YELLOW}⚠ Lines not in UTF-8: ${s}. The comparison is byte by byte: they will not match the same words in UTF-8. Prepare the files first: item 2${NC}"
 }
 
 _tl_logins() { LC_ALL=C grep -a -o -E "$TOOL_EMAIL_RE" | LC_ALL=C sed -b 's/@.*//'; }
@@ -2967,7 +3518,7 @@ tool_edge() {
             tool_tmp || return 1; tmp="$REPLY"
             L t "сортировка" "sort"
             progress_start "$t" "$(file_size "$rest")" read "$rest"
-            if ! LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" -o "$tmp" -- "$rest"; then
+            if ! LC_ALL=C sort -u "${SORT_OPTS[@]}" -o "$tmp" -- "$rest"; then
                 progress_stop
                 rm -f -- "$tmp" "$rest"; tool_release "$tmp" "$rest"
                 say "${RED}✘ Ошибка сортировки — результат не создан, исходный файл не тронут${NC}" "${RED}✘ Sort error — no result created, the source file is untouched${NC}" >&2
@@ -3010,7 +3561,7 @@ _tl_minus_chain() {
         LC_ALL=C comm -13 -- "${TOOL_DICTS[i]}" - | _tl_minus_chain $(( i + 1 ))
     fi
 }
-_tl_minus() { LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" | _tl_minus_chain 0; }
+_tl_minus() { LC_ALL=C sort -u "${SORT_OPTS[@]}" | _tl_minus_chain 0; }
 # Tool 15: remove from a file the lines that are in other dictionaries.
 tool_minus() {
     local f="$1" d tmp t i k n_in out fdir="" use_counts=true n_prev n_now
@@ -3023,17 +3574,18 @@ tool_minus() {
         fi
     done
     sort_opts
+    tool_bad_utf8_warn "$f" "${dicts[@]}"
     TOOL_DICTS=(); TOOL_FIFO=()
     for d in "${dicts[@]}"; do
         if ! has_crlf "$d" && ! has_bom "$d" && LC_ALL=C sort -c -- "$d" 2>/dev/null; then
             TOOL_DICTS+=("$d")
             continue
         fi
-        tool_tmp || return 1; tmp="$REPLY"; temps+=("$tmp")
+        tool_tmp s || return 1; tmp="$REPLY"; temps+=("$tmp")
         say "  ${d}: не отсортирован или с CRLF/BOM — сортирую во временный файл" "  ${d}: not sorted or has CRLF/BOM — sorting into a temporary file"
         L t "сортировка ${d##*/}" "sort ${d##*/}"
         progress_start "$t" "$(file_size "$d")" read "$d"
-        if ! LC_ALL=C sed -b -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' -- "$d" | LC_ALL=C sort -u -T . "${SORT_OPTS[@]}" > "$tmp"; then
+        if ! LC_ALL=C sed -b -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' -- "$d" | LC_ALL=C sort -u "${SORT_OPTS[@]}" > "$tmp"; then
             progress_stop
             rm -f -- "${temps[@]}"; tool_release "${temps[@]}"
             say "${RED}✘ Не удалось отсортировать ${d} — результат не создан${NC}" "${RED}✘ Could not sort ${d} — no result created${NC}" >&2
@@ -3181,6 +3733,18 @@ _tl_alpha_split() {
         print >> (p "." k)
     }'
 }
+_tl_alpha_what() {
+    case "$1" in
+        latin)  L REPLY "латиница и ASCII" "Latin and ASCII" ;;
+        cyr)    L REPLY "кириллица" "Cyrillic" ;;
+        greek)  L REPLY "греческий" "Greek" ;;
+        hebrew) L REPLY "иврит" "Hebrew" ;;
+        arabic) L REPLY "арабский" "Arabic" ;;
+        cjk)    L REPLY "иероглифы, кана, хангыль" "CJK, kana, hangul" ;;
+        other)  L REPLY "другие знаки и алфавиты" "other signs and alphabets" ;;
+        mixed)  L REPLY "несколько алфавитов в строке" "several alphabets in a line" ;;
+    esac
+}
 # Split a dictionary by alphabet into <name>_latin.txt, <name>_cyr.txt and so on.
 tool_alphabets() {
     local k t what
@@ -3188,23 +3752,25 @@ tool_alphabets() {
     tool_tmp || return 1
     TOOL_ALPHA_PREF="$REPLY"
     local -a kinds=(latin cyr greek hebrew arabic cjk other mixed)
+    local -a found=()
     for k in "${kinds[@]}"; do IN_PROGRESS+=("$TOOL_ALPHA_PREF.$k"); done
     L t "строки из ASCII" "ASCII lines"
     tool_stage "$TOOL_ALPHA_PREF.latin" "$t" _tl_ascii || return 1
     L t "алфавиты" "alphabets"
     tool_stage /dev/null "$t" _tl_alpha_split || return 1
     for k in "${kinds[@]}"; do
-        [[ -s "$TOOL_ALPHA_PREF.$k" ]] || { rm -f -- "$TOOL_ALPHA_PREF.$k"; tool_release "$TOOL_ALPHA_PREF.$k"; continue; }
-        case "$k" in
-            latin)  L what "латиница и ASCII" "Latin and ASCII" ;;
-            cyr)    L what "кириллица" "Cyrillic" ;;
-            greek)  L what "греческий" "Greek" ;;
-            hebrew) L what "иврит" "Hebrew" ;;
-            arabic) L what "арабский" "Arabic" ;;
-            cjk)    L what "иероглифы, кана, хангыль" "CJK, kana, hangul" ;;
-            other)  L what "другие знаки и алфавиты" "other signs and alphabets" ;;
-            mixed)  L what "несколько алфавитов в строке" "several alphabets in a line" ;;
-        esac
+        if [[ -s "$TOOL_ALPHA_PREF.$k" ]]; then found+=("$k"); else rm -f -- "$TOOL_ALPHA_PREF.$k"; tool_release "$TOOL_ALPHA_PREF.$k"; fi
+    done
+    if (( ${#found[@]} == 1 )); then
+        k="${found[0]}"
+        _tl_alpha_what "$k"
+        say "  Других алфавитов не найдено: все строки ($(fmt_num "$(wc -l < "$TOOL_ALPHA_PREF.$k")")) — ${REPLY}. Новых файлов не создано" "  No other alphabets found: all lines ($(fmt_num "$(wc -l < "$TOOL_ALPHA_PREF.$k")")) are ${REPLY}. No new files created"
+        rm -f -- "$TOOL_ALPHA_PREF.$k" "$TOOL_ALPHA_PREF"
+        tool_release "$TOOL_ALPHA_PREF.$k" "$TOOL_ALPHA_PREF"
+        return 0
+    fi
+    for k in "${found[@]}"; do
+        _tl_alpha_what "$k"; what="$REPLY"
         tool_finish "$TOOL_ALPHA_PREF.$k" "$k" "$what" || return 1
     done
     rm -f -- "$TOOL_ALPHA_PREF"
@@ -3212,7 +3778,7 @@ tool_alphabets() {
 }
 
 _tl_top1() {
-    LC_ALL=C sort -T . "${SORT_OPTS[@]}" | LC_ALL=C uniq -c | LC_ALL=C sort -T . "${SORT_OPTS[@]}" -s -k1,1nr \
+    LC_ALL=C sort "${SORT_OPTS[@]}" | LC_ALL=C uniq -c | LC_ALL=C sort "${SORT_OPTS[@]}" -s -k1,1nr \
         | _tl_top_head 's/^ *([0-9]+) /\1\t/p'
 }
 _tl_top_head() {
@@ -3231,7 +3797,7 @@ _tl_top_head() {
     fi
 }
 _tl_top_part() {
-    LC_ALL=C sort -T . "${SORT_OPTS[@]}" | LC_ALL=C uniq -c | LC_ALL=C sed -b -E 's/^ *([0-9]+) (.*)$/\2\x01\1/'
+    LC_ALL=C sort "${SORT_OPTS[@]}" | LC_ALL=C uniq -c | LC_ALL=C sed -b -E 's/^ *([0-9]+) (.*)$/\2\x01\1/'
 }
 # The most frequent lines of one or several files.
 tool_top() {
@@ -3253,20 +3819,20 @@ tool_top() {
             TOOL_INPUT="$f"
             TOOL_STRIP=false
             if has_crlf "$f" || has_bom "$f"; then TOOL_STRIP=true; fi
-            tool_tmp || return 1
+            tool_tmp s || return 1
             parts+=("$REPLY")
             L t "подсчёт: ${f##*/}" "counting: ${f##*/}"
             tool_stage "$REPLY" "$t" _tl_top_part || return 1
         done
         TOOL_INPUT="$1"
-        LC_ALL=C sort -T . "${SORT_OPTS[@]}" -s -t $'\x01' -k1,1 -- "${parts[@]}" \
+        LC_ALL=C sort "${SORT_OPTS[@]}" -s -t $'\x01' -k1,1 -- "${parts[@]}" \
             | LC_ALL=C awk -F '\001' '{
                   n = $NF; k = substr($0, 1, length($0) - length(n) - 1)
                   if (NR > 1 && k != p) { print t "\001" d "\001" p; t = 0; d = 0 }
                   p = k; t += n; d++
               }
               END { if (NR) print t "\001" d "\001" p }' \
-            | LC_ALL=C sort -T . "${SORT_OPTS[@]}" -s -t $'\x01' -k1,1nr \
+            | LC_ALL=C sort "${SORT_OPTS[@]}" -s -t $'\x01' -k1,1nr \
             | _tl_top_head 's/^([0-9]+)\x01([0-9]+)\x01/\1\t\2\t/p' > "$tmp"
         rm -f -- "${parts[@]}"
         tool_release "${parts[@]}"
@@ -3290,8 +3856,8 @@ tool_top() {
 }
 
 _tl_uniq() {
-    LC_ALL=C cat -n | LC_ALL=C sort -T . "${SORT_OPTS[@]}" -t "$TAB_CHR" -s -u -k2 \
-        | LC_ALL=C sort -T . "${SORT_OPTS[@]}" -t "$TAB_CHR" -k1,1n | LC_ALL=C cut -f2-
+    LC_ALL=C cat -n | LC_ALL=C sort "${SORT_OPTS[@]}" -t "$TAB_CHR" -s -u -k2 \
+        | LC_ALL=C sort "${SORT_OPTS[@]}" -t "$TAB_CHR" -k1,1n | LC_ALL=C cut -f2-
 }
 
 # Find a line in the dictionaries: in which files and how many times.
@@ -3341,7 +3907,7 @@ cmd_tool() {
     IN_PROGRESS=()
     case "$TOOL_SUB" in
         logins)
-            tool_tmp || return 1; tmp="$REPLY"
+            tool_tmp s || return 1; tmp="$REPLY"
             L t "логины" "logins"
             tool_stage "$tmp" "$t" _tl_logins || return 1
             tool_finish "$tmp" logins "$t" sort || return 1
@@ -3350,11 +3916,11 @@ cmd_tool() {
             tool_rest || return 1
             ;;
         userpass)
-            tool_tmp || return 1; tmp="$REPLY"
+            tool_tmp s || return 1; tmp="$REPLY"
             L t "логины" "logins"
             tool_stage "$tmp" "$t" _tl_up_left || return 1
             tool_finish "$tmp" logins "$t" sort || return 1
-            tool_tmp || return 1; tmp="$REPLY"
+            tool_tmp s || return 1; tmp="$REPLY"
             L t "пароли" "passwords"
             tool_stage "$tmp" "$t" _tl_up_right || return 1
             tool_finish "$tmp" passwords "$t" sort || return 1
@@ -3364,13 +3930,13 @@ cmd_tool() {
             TOOL_SEP="${TOOL_OPTS[0]}"
             TOOL_SEP_RE="$(printf '%s' "$TOOL_SEP" | LC_ALL=C sed -e 's/[][\.*^$/]/\\&/g')"
             if [[ "${TOOL_OPTS[1]}" != right ]]; then
-                tool_tmp || return 1; tmp="$REPLY"
+                tool_tmp s || return 1; tmp="$REPLY"
                 L t "левая часть" "left part"
                 tool_stage "$tmp" "$t" _tl_cut_left || return 1
                 tool_finish "$tmp" left "$t" sort || return 1
             fi
             if [[ "${TOOL_OPTS[1]}" != left ]]; then
-                tool_tmp || return 1; tmp="$REPLY"
+                tool_tmp s || return 1; tmp="$REPLY"
                 L t "правая часть" "right part"
                 tool_stage "$tmp" "$t" _tl_cut_right || return 1
                 tool_finish "$tmp" right "$t" sort || return 1
@@ -3381,7 +3947,7 @@ cmd_tool() {
             local -a ex_kinds=("${TOOL_OPTS[@]}")
             (( ${#ex_kinds[@]} > 0 )) || ex_kinds=(emails urls ip)
             for k in "${ex_kinds[@]}"; do
-                tool_tmp || return 1; tmp="$REPLY"
+                tool_tmp s || return 1; tmp="$REPLY"
                 case "$k" in
                     emails) L t "адреса почты" "email addresses"; tool_stage "$tmp" "$t" _tl_emails || return 1 ;;
                     urls)   L t "ссылки" "links"; tool_stage "$tmp" "$t" _tl_urls || return 1 ;;
@@ -3597,7 +4163,7 @@ pick_tool_files() {
     out "  0) назад" "  0) back"
     while true; do
         L q "Номера через пробел, Enter — все файлы: " "Numbers separated by spaces, Enter — all files: "
-        read -r -p "$q" choice || return 1
+        read_line "$q" || return 1; choice="$REPLY"
         read -r -a parts <<< "${choice//,/ }"
         [[ "${parts[*]}" == 0 ]] && return 1
         if (( ${#parts[@]} == 0 )); then
@@ -3633,7 +4199,7 @@ pick_minus_files() {
     out "  0) назад" "  0) back"
     while [[ -z "$first" ]]; do
         L q "Из какого файла убирать строки (номер): " "Which file to remove the lines from (number): "
-        read -r -p "$q" choice || return 1
+        read_line "$q" || return 1; choice="$REPLY"
         k="${choice// /}"
         [[ "$k" == 0 || -z "$k" ]] && return 1
         if [[ "$k" =~ ^[0-9]+$ ]] && (( 10#$k >= 1 && 10#$k <= ${#files[@]} )); then
@@ -3644,7 +4210,7 @@ pick_minus_files() {
     done
     while true; do
         L q "Какие словари вычесть: номера через пробел, Enter — все остальные: " "Which dictionaries to subtract: numbers separated by spaces, Enter — all the others: "
-        read -r -p "$q" choice || return 1
+        read_line "$q" || return 1; choice="$REPLY"
         read -r -a parts <<< "${choice//,/ }"
         [[ "${parts[*]}" == 0 ]] && return 1
         PICKED=("$first")
@@ -3692,7 +4258,7 @@ tools_menu() {
         out " 15) Убрать из файла строки других словарей → <имя>_minus.txt" " 15) Remove from a file the lines of other dictionaries → <name>_minus.txt"
         out "  0) Назад" "  0) Back"
         L q "Выберите пункт: " "Choose an item: "
-        if ! read -r -p "$q" c; then echo; return 0; fi
+        if ! read_line "$q"; then echo; return 0; fi; c="$REPLY"
         [[ -n "${c// /}" ]] && echo
         TOOL_OPTS=()
         case "${c// /}" in
@@ -3702,10 +4268,10 @@ tools_menu() {
             3)
                 pick_work_file one || continue
                 L q "Разделитель (например : / ; --- (at)), Enter — назад: " "Separator (for example : / ; --- (at)), Enter — back: "
-                read -r -p "$q" a || continue
+                read_line "$q" || continue; a="$REPLY"
                 [[ -n "$a" ]] || continue
                 L q "Какая часть: 1 — левая, 2 — правая, 3 — обе [3]: " "Which part: 1 — left, 2 — right, 3 — both [3]: "
-                read -r -p "$q" k || k=3
+                read_line "$q" && k="$REPLY" || k=3
                 case "${k// /}" in 1) k=left ;; 2) k=right ;; *) k=both ;; esac
                 TOOL_SUB=cut; TOOL_OPTS=("$a" "$k")
                 run_action tool "${PICKED[0]}"
@@ -3713,7 +4279,7 @@ tools_menu() {
             4)
                 pick_work_file one || continue
                 L q "Что вырезать: 1 — почта, 2 — ссылки, 3 — IP (можно через пробел), Enter — всё: " "What to cut out: 1 — emails, 2 — links, 3 — IPs (several separated by spaces), Enter — everything: "
-                read -r -p "$q" a || a=""
+                read_line "$q" && a="$REPLY" || a=""
                 read -r -a pieces <<< "${a//,/ }"
                 TOOL_SUB=extract
                 for k in "${pieces[@]}"; do
@@ -3724,7 +4290,7 @@ tools_menu() {
             5)
                 pick_work_file one || continue
                 L q "1 — RU → EN («привет» → «ghbdtn»), 2 — EN → RU («ghbdtn» → «привет») [1]: " "1 — RU → EN («привет» → «ghbdtn»), 2 — EN → RU («ghbdtn» → «привет») [1]: "
-                read -r -p "$q" k || k=1
+                read_line "$q" && k="$REPLY" || k=1
                 [[ "${k// /}" == 2 ]] && k=en2ru || k=ru2en
                 TOOL_SUB=layout; TOOL_OPTS=("$k")
                 run_action tool "${PICKED[0]}"
@@ -3732,7 +4298,7 @@ tools_menu() {
             6)
                 pick_work_file one || continue
                 L q "1 — все маленькие, 2 — все большие, 3 — первая большая, 4 — первая маленькая, 5 — все четыре файла сразу, Enter — назад: " "1 — all lower, 2 — all upper, 3 — first upper, 4 — first lower, 5 — all four files at once, Enter — back: "
-                read -r -p "$q" k || continue
+                read_line "$q" || continue; k="$REPLY"
                 case "${k// /}" in
                     1) k=lower ;; 2) k=upper ;; 3) k=cap ;; 4) k=uncap ;; 5) k=all ;;
                     *) continue ;;
@@ -3743,7 +4309,7 @@ tools_menu() {
             7)
                 pick_work_file one || continue
                 L q "1 — убрать строки с пробелом или табом, 2 — оставить только первое слово [1]: " "1 — remove lines with a space or tab, 2 — keep only the first word [1]: "
-                read -r -p "$q" k || k=1
+                read_line "$q" && k="$REPLY" || k=1
                 [[ "${k// /}" == 2 ]] && k=first || k=remove
                 TOOL_SUB=spaces; TOOL_OPTS=("$k")
                 run_action tool "${PICKED[0]}"
@@ -3754,7 +4320,7 @@ tools_menu() {
                 out "  Строка уходит, если в ней есть хоть один кусок. Ищется как есть, большие и маленькие буквы различаются." "  A line goes if it has at least one of the pieces. They are searched as they are, upper and lower case differ."
                 out "  Например: «- admin» — два куска, уйдут строки с дефисом и строки с admin; «-admin» — один кусок, только такое сочетание." "  For example: «- admin» is two pieces, lines with a hyphen and lines with admin go; «-admin» is one piece, only this exact combination."
                 L q "Что искать: один или несколько кусков через пробел, Enter — назад: " "What to look for: one or several pieces separated by spaces, Enter — back: "
-                read -r -p "$q" a || continue
+                read_line "$q" || continue; a="$REPLY"
                 read -r -a pieces <<< "$a"
                 (( ${#pieces[@]} > 0 )) || continue
                 TOOL_SUB=filter; TOOL_OPTS=("${pieces[@]}")
@@ -3764,7 +4330,7 @@ tools_menu() {
             11)
                 pick_tool_files || continue
                 L q "Сколько строк в результате [100]: " "How many lines in the result [100]: "
-                read -r -p "$q" k || k=100
+                read_line "$q" && k="$REPLY" || k=100
                 k="${k// /}"
                 [[ "$k" =~ ^[0-9]+$ ]] && (( 10#$k >= 1 )) || k=100
                 TOOL_SUB=top; TOOL_OPTS=("$((10#$k))")
@@ -3773,7 +4339,7 @@ tools_menu() {
             12) pick_work_file one && { TOOL_SUB=uniq; run_action tool "${PICKED[0]}"; } ;;
             13)
                 L q "Какую строку искать, Enter — назад: " "Which line to look for, Enter — back: "
-                read -r -p "$q" a || continue
+                read_line "$q" || continue; a="$REPLY"
                 [[ -n "$a" ]] || continue
                 tool_find_files
                 if (( ${#TOOL_FILES[@]} == 0 )); then
@@ -3786,7 +4352,7 @@ tools_menu() {
             14)
                 pick_work_file one || continue
                 L q "1 — вынести такие строки в <имя>_edge.txt и убрать из словаря, 2 — обрезать справа, 3 — обрезать слева, Enter — назад: " "1 — move such lines to <name>_edge.txt and remove them from the dictionary, 2 — trim on the right, 3 — trim on the left, Enter — back: "
-                read -r -p "$q" k || continue
+                read_line "$q" || continue; k="$REPLY"
                 case "${k// /}" in
                     1) k=move ;; 2) k=right ;; 3) k=left ;;
                     *) continue ;;
@@ -4157,7 +4723,7 @@ run_action() {
             fi
             ;;
     esac
-    RESULT_FILES=(); ACTION_FILES=(); FINAL_DIR=""; WSL_TEMP_DIR=""
+    RESULT_FILES=(); ACTION_FILES=(); FINAL_DIR=""; WSL_TEMP_DIR=""; MERGE_MOVE=false
     EXTRA_REFS=(); QUEUE_REFS=(); QUEUE_REF_SKIP=(); QUEUE_REFS_READY=false; QUEUE_ON=false
     MEMO=(); MEMO_NEW=(); MEMO_ON=false
     ACTION_KIND="$kind"
@@ -4170,7 +4736,9 @@ run_action() {
     ms_now; LOG_T0=$REPLY
     if [[ "$kind" == tool ]]; then
         [[ "$TOOL_SUB" == find ]] && name=search
-        log_open "$log_kind" "$name" "${args[@]}" "${TOOL_OPTS[@]}"
+        local -a lopts=()
+        for f in "${TOOL_OPTS[@]}"; do [[ "$f" == ask ]] || lopts+=("$f"); done
+        log_open "$log_kind" "$name" "${args[@]}" "${lopts[@]}"
     else
         log_open "$kind" "$name" "${args[@]}"
     fi
@@ -4211,6 +4779,12 @@ run_action() {
     fi
 
     ACTION_FILES=("${args[@]}")
+    SORT_TMP_EFF=""
+    case "$kind" in
+        split) ;;
+        tool) case "$TOOL_SUB" in logins|userpass|cut|extract|top|uniq|minus|edge) sort_tmp_prepare "${args[@]}" ;; esac ;;
+        *) sort_tmp_prepare "${args[@]}" ;;
+    esac
     case "$kind" in
         full)    cmd_full "${args[@]}" ;;
         clean)   cmd_clean "${args[@]}" ;;
@@ -4233,6 +4807,7 @@ run_action() {
         fi
     fi
     [[ "$kind" == queue ]] && (( rc == 0 )) && move_originals "${orig_args[@]}"
+    [[ "$kind" == merge ]] && (( rc == 0 )) && $MERGE_MOVE && move_originals "${orig_args[@]}"
     ms_now
     if (( rc == 0 )); then
         say "\n${GREEN}Готово за $(fmt_dur $(( REPLY - LOG_T0 )))${NC}" "\n${GREEN}Done in $(fmt_dur $(( REPLY - LOG_T0 )))${NC}"
@@ -4244,6 +4819,7 @@ run_action() {
     [[ -n "$LOG_FILE" ]] && out "Лог: ${LOG_FILE#"$ACTION_ORIG_DIR"/}" "Log: ${LOG_FILE#"$ACTION_ORIG_DIR"/}"
     LOG_FILE=""
     WSL_TEMP_DIR=""
+    SORT_TMP_EFF=""
     return "$rc"
 }
 
@@ -4307,7 +4883,7 @@ pick_work_file() {
     out "  0) назад в меню" "  0) back to the menu"
     while true; do
         L q "Номер: " "Number: "
-        read -r -p "$q" choice || return 1
+        read_line "$q" || return 1; choice="$REPLY"
         choice="${choice// /}"
         if [[ "$choice" == 0 ]]; then
             return 1
@@ -4326,7 +4902,7 @@ pick_work_file() {
 # Choose several files in order (queue, merge) into PICKED.
 pick_many_files() {
     local mode="$1" choice i k f dup ok again="" def_text q
-    local -a files=() parts=() defs=()
+    local -a files=() parts=() defs=() alls=()
     shopt -s nullglob
     files=(*.txt)
     shopt -u nullglob
@@ -4338,6 +4914,7 @@ pick_many_files() {
     for f in "${files[@]}"; do
         if [[ "$mode" == merge ]]; then
             is_final "$f" && defs+=("$f")
+            is_list "$f" || alls+=("$f")
         else
             is_final "$f" || is_merged "$f" || is_list "$f" || is_side "$f" || defs+=("$f")
         fi
@@ -4347,9 +4924,10 @@ pick_many_files() {
         return 1
     fi
     if [[ "$mode" == merge ]]; then
-        out "${CYAN}Объединение итогов${NC}" "${CYAN}Merging results${NC}"
-        out "Файлы склеятся в один без повторов — merged.txt, а рядом появится" "The files are joined into one without duplicates — merged.txt, and next to it"
-        out "merged_list.txt со списком файлов. Если такие уже есть — merged_2.txt и т.д." "merged_list.txt with the list of files. If they exist — merged_2.txt and so on."
+        out "${CYAN}Объединение файлов${NC}" "${CYAN}Merging files${NC}"
+        out "Файлы склеятся в один без повторов — merged.txt (если есть — merged_2.txt и т.д.)," "The files are joined into one without duplicates — merged.txt (if it exists — merged_2.txt and so on),"
+        out "а в журнал merged_list.txt допишется, из каких файлов он собран." "and the log merged_list.txt gets a record of the files it is made of."
+        out "«все» — все файлы папки ($(( ${#alls[@]} ))), кроме списков объединения." "«all» — all files of the folder ($(( ${#alls[@]} ))) except the merge lists."
         L def_text "все итоги _final (${#defs[@]})" "all _final results (${#defs[@]})"
     else
         out "${CYAN}Несколько словарей по очереди${NC}" "${CYAN}Several dictionaries in a queue${NC}"
@@ -4369,13 +4947,15 @@ pick_many_files() {
             choice="$again"; again=""
         else
             L q "Номера в нужном порядке через пробел (например 3 1 2), Enter — ${def_text}: " "Numbers in the order you want, separated by spaces (for example 3 1 2), Enter — ${def_text}: "
-            read -r -p "$q" choice || return 1
+            read_line "$q" || return 1; choice="$REPLY"
         fi
         read -r -a parts <<< "${choice//,/ }"
         [[ "${parts[*]}" == 0 ]] && return 1
         PICKED=(); ok=true
         if (( ${#parts[@]} == 0 )); then
             PICKED=("${defs[@]}")
+        elif [[ "$mode" == merge ]] && [[ "${parts[*]}" == все || "${parts[*]}" == Все || "${parts[*]}" == ВСЕ || "${parts[*],,}" == all ]]; then
+            PICKED=("${alls[@]}")
         else
             for k in "${parts[@]}"; do
                 if ! [[ "$k" =~ ^[0-9]+$ ]] || (( 10#$k < 1 || 10#$k > ${#files[@]} )); then ok=false; break; fi
@@ -4400,7 +4980,7 @@ pick_many_files() {
             fi
             for i in "${!PICKED[@]}"; do echo -e "  ${GREEN}$((i + 1)).${NC} ${PICKED[i]}"; done
             L q "Enter — начать, 0 — назад в меню, или другие номера: " "Enter — start, 0 — back to the menu, or other numbers: "
-            read -r -p "$q" choice || return 1
+            read_line "$q" || return 1; choice="$REPLY"
             [[ -z "${choice// /}" ]] && return 0
             [[ "${choice// /}" == 0 ]] && return 1
             again="$choice"
@@ -4413,7 +4993,7 @@ lang_menu() {
     local c q
     echo "  1) Русский"
     echo "  2) English"
-    if ! read -r -p "Язык / Language [1/2]: " c; then echo; return 0; fi
+    if ! read_line "Язык / Language [1/2]: "; then echo; return 0; fi; c="$REPLY"
     case "${c// /}" in
         1|ru|RU) UI_LANG=ru ;;
         2|en|EN) UI_LANG=en ;;
@@ -4426,26 +5006,144 @@ lang_menu() {
     fi
 }
 
+# Menu item 9: the folder for the sort temp files and the sort memory.
+sort_menu() {
+    local c v q t mkb a
+    while true; do
+        echo
+        out "${CYAN}Временные файлы и память для сортировки${NC}" "${CYAN}Temp files and memory for sorting${NC}"
+        out "Нужны, когда словарь не помещается в память: тогда sort пишет временные файлы" "They matter when a dictionary does not fit in memory: then sort writes temp files"
+        out "примерно в размер словаря. Их можно вынести на другой диск, например съёмный." "of about the dictionary size. They can go to another drive, a removable one for example."
+        if [[ -n "$SORT_TMP_SET" ]]; then
+            dir_free "$SORT_TMP_SET"
+            if [[ -d "$SORT_TMP_SET" ]]; then
+                out "  Папка: $(disp_dir "$SORT_TMP_SET") (свободно $(fmt_size "$REPLY"))" "  Folder: $(disp_dir "$SORT_TMP_SET") ($(fmt_size "$REPLY") free)"
+            else
+                out "  Папка: $(disp_dir "$SORT_TMP_SET") ${YELLOW}(её сейчас нет — будет рядом с итогом)${NC}" "  Folder: $(disp_dir "$SORT_TMP_SET") ${YELLOW}(it does not exist now — next to the result)${NC}"
+            fi
+        else
+            out "  Папка: рядом с итогом (по умолчанию)" "  Folder: next to the result (default)"
+        fi
+        sort_mem_text; t="$REPLY"
+        mem_avail_kb; a="$REPLY"
+        out "  Память: ${t} (сейчас доступно $(fmt_size $(( a * 1024 ))))" "  Memory: ${t} ($(fmt_size $(( a * 1024 ))) available now)"
+        [[ -n "${DEDUP_SORT_TMP+x}" ]] && out "  ${YELLOW}Папку задаёт переменная DEDUP_SORT_TMP — она сильнее этой настройки${NC}" "  ${YELLOW}The folder is set by DEDUP_SORT_TMP — it overrides this setting${NC}"
+        [[ -n "${DEDUP_SORT_MEM+x}" ]] && out "  ${YELLOW}Память задаёт переменная DEDUP_SORT_MEM — она сильнее этой настройки${NC}" "  ${YELLOW}The memory is set by DEDUP_SORT_MEM — it overrides this setting${NC}"
+        out "  1) Изменить папку" "  1) Change the folder"
+        out "  2) Изменить память" "  2) Change the memory"
+        out "  3) Вернуть по умолчанию: рядом с итогом и половина доступной памяти" "  3) Back to the defaults: next to the result and half of the available memory"
+        out "  0) Назад" "  0) Back"
+        L q "Выберите пункт: " "Choose an item: "
+        if ! read_line "$q"; then echo; return 0; fi; c="$REPLY"
+        case "${c// /}" in
+            0|"") return 0 ;;
+            1)
+                L q "Папка (например D:\\tmp или /mnt/e/tmp), Enter — рядом с итогом: " "Folder (for example D:\\tmp or /mnt/e/tmp), Enter — next to the result: "
+                read_line "$q" && v="$REPLY" || v=""
+                if [[ -z "${v//[[:space:]]/}" ]]; then
+                    sort_cfg_save tmp ""
+                    continue
+                fi
+                dir_norm "$v"; v="$REPLY"
+                t=""
+                if [[ "$v" =~ ^(/mnt/[a-z])(/|$) ]] && grep -qi microsoft /proc/version 2>/dev/null; then t="${BASH_REMATCH[1]}"
+                elif command -v cygpath >/dev/null 2>&1 && [[ "$v" =~ ^(/[a-z])(/|$) ]]; then t="${BASH_REMATCH[1]}"; fi
+                if [[ -n "$t" && ! -d "$t/" ]]; then
+                    t="${t: -1}"; t="${t^^}"
+                    out "${RED}✘ Диска ${t}: нет — съёмный диск не подключён? Настройка не изменена${NC}" "${RED}✘ There is no drive ${t}: — a removable drive not connected? The setting is unchanged${NC}"
+                    continue
+                fi
+                if [[ ! -d "$v" ]]; then
+                    L q "Папки $(disp_dir "$v") нет. Создать?" "The folder $(disp_dir "$v") does not exist. Create it?"
+                    confirm_action "$q" y || continue
+                    if ! mkdir -p -- "$v" 2>/dev/null; then
+                        out "${RED}✘ Не удалось создать папку $(disp_dir "$v") — настройка не изменена${NC}" "${RED}✘ Could not create the folder $(disp_dir "$v") — the setting is unchanged${NC}"
+                        continue
+                    fi
+                fi
+                if ! t="$(mktemp "$v/.dedup_tool.XXXXXX" 2>/dev/null)"; then
+                    out "${RED}✘ В папку $(disp_dir "$v") нельзя писать — настройка не изменена${NC}" "${RED}✘ Cannot write to the folder $(disp_dir "$v") — the setting is unchanged${NC}"
+                    continue
+                fi
+                rm -f -- "$t"
+                if dir_on_wsl_mnt "$v"; then
+                    out "${YELLOW}⚠ Это диск Windows. Из WSL временные файлы sort идут через мост и пишутся в десятки раз медленнее:${NC}" "${YELLOW}⚠ This is a Windows drive. From WSL the sort temp files go through the bridge and are written tens of times slower:${NC}"
+                    out "${YELLOW}  330 МБ сортируются 6 с во временной папке Linux, а на /mnt/d не кончили и за 200 с.${NC}" "${YELLOW}  330 MB sort in 6 s in the Linux temp folder, and on /mnt/d did not finish in 200 s.${NC}"
+                    out "${YELLOW}  В WSL лучше папка Linux (её можно держать и на отдельном диске).${NC}" "${YELLOW}  In WSL a Linux folder is better (it can live on a separate drive too).${NC}"
+                    L q "Всё равно взять эту папку?" "Use this folder anyway?"
+                    confirm_action "$q" n || continue
+                fi
+                sort_cfg_save tmp "$v"
+                ;;
+            2)
+                L q "Память: auto, размер (4G, 500M) или доля доступной (70%), Enter — авто: " "Memory: auto, a size (4G, 500M) or a share of the available memory (70%), Enter — auto: "
+                read_line "$q" && v="$REPLY" || v=""
+                if ! sort_mem_parse "$v"; then
+                    out "${YELLOW}Не понял «${v}»: нужно auto, 4G, 500M или 70% (от 1 до 90 %) — настройка не изменена${NC}" "${YELLOW}Could not understand «${v}»: auto, 4G, 500M or 70% (1 to 90%) — the setting is unchanged${NC}"
+                    continue
+                fi
+                v="$REPLY"
+                if [[ "$v" == *[KMGT] ]]; then
+                    mem_to_kb "$v"; mkb="$REPLY"
+                    mem_avail_kb; a="$REPLY"
+                    if (( a > 0 && mkb > a )); then
+                        out "${YELLOW}⚠ Сейчас доступно только $(fmt_size $(( a * 1024 ))): если sort займёт больше, начнётся подкачка, и будет медленно${NC}" "${YELLOW}⚠ Only $(fmt_size $(( a * 1024 ))) is available now: if sort takes more, swapping starts and it gets slow${NC}"
+                        L q "Всё равно задать $(fmt_size $(( mkb * 1024 )))?" "Set $(fmt_size $(( mkb * 1024 ))) anyway?"
+                        confirm_action "$q" n || continue
+                    fi
+                fi
+                sort_cfg_save mem "$v"
+                ;;
+            3)
+                sort_cfg_save tmp ""
+                sort_cfg_save mem ""
+                ;;
+            *) out "${YELLOW}Нет такого пункта: ${c}${NC}" "${YELLOW}No such item: ${c}${NC}" ;;
+        esac
+    done
+}
+sort_cfg_save() {
+    local f="$SORT_TMP_FILE" what
+    [[ "$1" == mem ]] && f="$SORT_MEM_FILE"
+    if [[ -z "$2" ]]; then
+        rm -f -- "$f" 2>/dev/null
+    elif ! { mkdir -p "${f%/*}" 2>/dev/null && printf '%s\n' "$2" > "$f" 2>/dev/null; }; then
+        out "${RED}✘ Не удалось записать ${f} — настройка не изменена${NC}" "${RED}✘ Could not write ${f} — the setting is unchanged${NC}"
+        return 1
+    fi
+    sort_cfg_load
+    if [[ "$1" == mem ]]; then
+        sort_mem_text; what="$REPLY"
+        out "${GREEN}✓ Память для сортировки: ${what}${NC}" "${GREEN}✓ Sort memory: ${what}${NC}"
+    elif [[ -n "$SORT_TMP_SET" ]]; then
+        out "${GREEN}✓ Временные файлы сортировки: $(disp_dir "$SORT_TMP_SET")${NC}" "${GREEN}✓ Sort temp files: $(disp_dir "$SORT_TMP_SET")${NC}"
+    else
+        out "${GREEN}✓ Временные файлы сортировки: рядом с итогом${NC}" "${GREEN}✓ Sort temp files: next to the result${NC}"
+    fi
+}
+
 # Main menu loop.
 main_menu() {
     local choice spec q
     while true; do
         menu_header
-        out "  1) Полная обработка: подготовка и сравнение с эталонами → <имя>_final.txt" "  1) Full processing: preparation and comparison with references → <name>_final.txt"
-        out "  2) Только подготовка (кодировка, CRLF/BOM, фильтры) → <имя>_prep.txt" "  2) Preparation only (encoding, CRLF/BOM, filters) → <name>_prep.txt"
-        out "  3) Только сравнение с эталонами, файл как есть → <имя>_final.txt" "  3) Comparison with references only, the file as is → <name>_final.txt"
-        out "  4) Несколько словарей по очереди: каждый чистится и от предыдущих → _final у каждого" "  4) Several dictionaries in a queue: each is also cleaned of the previous ones → _final for each"
-        out "  5) Объединить итоги _final в один файл → merged.txt и список файлов merged_list.txt" "  5) Merge _final results into one file → merged.txt and the list of files merged_list.txt"
+        out "  1) Полная обработка: подготовка, без повторов, сравнение с эталонами → <имя>_final.txt" "  1) Full processing: preparation, no duplicates, comparison with references → <name>_final.txt"
+        out "  2) Только подготовка (кодировка, CRLF/BOM, фильтры; повторы остаются) → <имя>_prep.txt" "  2) Preparation only (encoding, CRLF/BOM, filters; duplicates stay) → <name>_prep.txt"
+        out "  3) Только сравнение с эталонами и без повторов, файл как есть → <имя>_final.txt" "  3) Comparison with references and no duplicates, the file as is → <name>_final.txt"
+        out "  4) Несколько словарей по очереди, без повторов и между ними → _final у каждого" "  4) Several dictionaries in a queue, no duplicates even between them → _final for each"
+        out "  5) Объединить файлы в один без повторов (итоги _final или все) → merged.txt" "  5) Merge files into one without duplicates (_final results or all) → merged.txt"
         out "  6) Разделить готовый файл на части" "  6) Split a finished file into parts"
         out "  7) Работа со словарями: логины, раскладка, регистр, алфавиты, поиск…" "  7) Dictionary tools: logins, keyboard layout, case, alphabets, search…"
         out "  8) Язык / Language: русский" "  8) Language / Язык: English"
-        out "  9) Справка" "  9) Help"
+        out "  9) Временные файлы и память для сортировки" "  9) Temp files and memory for sorting"
+        out " 10) Справка" " 10) Help"
         out "  0) Выход" "  0) Exit"
         L q "Выберите пункт: " "Choose an item: "
-        if ! read -r -p "$q" choice; then
+        if ! read_line "$q"; then
             echo
             exit 0
         fi
+        choice="$REPLY"
         [[ -n "${choice// /}" ]] && echo
         case "${choice// /}" in
             1) pick_work_file one && run_action full "${PICKED[0]}" ;;
@@ -4456,13 +5154,14 @@ main_menu() {
             6)
                 if pick_work_file one; then
                     L q "Число частей (например 4) или размер части (500M, 2G), Enter — по ${DEFAULT_SPLIT_SIZE}: " "Number of parts (for example 4) or part size (500M, 2G), Enter — ${DEFAULT_SPLIT_SIZE} each: "
-                    read -r -p "$q" spec || spec=""
+                    read_line "$q" && spec="$REPLY" || spec=""
                     run_action split "${PICKED[0]}" "${spec:-$DEFAULT_SPLIT_SIZE}"
                 fi
                 ;;
             7) tools_menu ;;
             8) lang_menu ;;
-            9) show_help ;;
+            9) sort_menu ;;
+            10) show_help ;;
             0) exit 0 ;;
             "") ;;
             *) out "${YELLOW}Нет такого пункта: ${choice}${NC}" "${YELLOW}No such item: ${choice}${NC}" ;;
@@ -4471,6 +5170,7 @@ main_menu() {
 }
 
 # Entry point: the menu, --help, --version or a hidden command.
+sort_cfg_load
 case "${1:-}" in
     "")
         main_menu
