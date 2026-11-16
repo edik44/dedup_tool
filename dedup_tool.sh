@@ -22,7 +22,7 @@ if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
 fi
 
 # Settings. DEDUP_WORK_ROOT — where the WSL temp folders go.
-VERSION="1.4.0"
+VERSION="1.5.0"
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_TIMEOUT=20
 DEFAULT_SPLIT_SIZE="2G"
@@ -74,6 +74,9 @@ lang_detect() {
     UI_LANG="${REPLY:-en}"
 }
 L() { if [[ "$UI_LANG" == en ]]; then printf -v "$1" '%s' "$3"; else printf -v "$1" '%s' "$2"; fi; }
+FC_RECHECK=false
+[[ "${DEDUP_RECHECK:-}" == 1 ]] && FC_RECHECK=true
+if [[ "${1:-}" == --recheck ]]; then FC_RECHECK=true; shift; fi
 case "${1:-}" in
     --lang|--lang=*)
         if [[ "$1" == --lang ]]; then lang_norm "${2:-}"; shift; else lang_norm "${1#--lang=}"; fi
@@ -85,6 +88,7 @@ case "${1:-}" in
         DEDUP_LANG="$REPLY"
         ;;
 esac
+if [[ "${1:-}" == --recheck ]]; then FC_RECHECK=true; shift; fi
 lang_detect
 
 declare -a IN_PROGRESS=()
@@ -94,8 +98,10 @@ declare -a COUNTER_PIDS=()
 on_interrupt() {
     [[ -n "${PROGRESS_PID:-}" ]] && kill "$PROGRESS_PID" 2>/dev/null
     (( ${#COUNTER_PIDS[@]} > 0 )) && kill "${COUNTER_PIDS[@]}" 2>/dev/null
+    (( ${#AN_PIDS[@]} > 0 )) && kill "${AN_PIDS[@]}" 2>/dev/null
     (( ${#IN_PROGRESS[@]} > 0 )) && rm -f -- "${IN_PROGRESS[@]}"
     (( ${#TMP_DIRS[@]} > 0 )) && rm -rf -- "${TMP_DIRS[@]}"
+    [[ -n "$AN_TMP" ]] && rm -rf -- "$AN_TMP"
     if (( BASH_SUBSHELL == 0 )); then
         local m
         out "\n${YELLOW}Прервано пользователем${NC}" "\n${YELLOW}Interrupted by the user${NC}"
@@ -120,6 +126,12 @@ declare -A MEMO=() MEMO_NEW=()
 QUEUE_ON=false
 QUEUE_REFS_READY=false
 MEMO_ON=false
+PREP_ANALYZE=false
+AN_AT_R=""; AN_AT_E=""; AN_Q_R="вопрос ниже"; AN_Q_E="a later question"
+PREP_AUTO=false
+CONFIRM_AUTO=false
+declare -a ANALYZE_NEXT=() AN_PIDS=()
+AN_TMP=""
 
 LOG_FILE=""
 LOG_T0=0
@@ -139,6 +151,8 @@ log_line() {
 
 # say "ru" "en": print (like echo -e) and log the text in the UI language.
 say() { local m="$1"; [[ "$UI_LANG" == en && $# -gt 1 ]] && m="$2"; echo -e "$m"; log_line "$m"; }
+# An empty line before a "finding and its question" block — on the screen only, not in the log.
+gap() { echo; }
 # out "ru" "en": print only, without logging (menus).
 out() { local m="$1"; [[ "$UI_LANG" == en && $# -gt 1 ]] && m="$2"; echo -e "$m"; }
 
@@ -352,7 +366,12 @@ if ! command -v iconv >/dev/null 2>&1; then
 fi
 
 CR_CHR=$'\r'
-has_crlf() { LC_ALL=C grep -qaU "${CR_CHR}\$" -- "$1" 2>/dev/null; }
+has_crlf() {
+    if fc_get crlf "$1"; then [[ "$REPLY" == 1 ]]; return; fi
+    if LC_ALL=C grep -qaU "${CR_CHR}\$" -- "$1" 2>/dev/null; then fc_put crlf "$1" 1; return 0; fi
+    fc_put crlf "$1" 0
+    return 1
+}
 
 has_bom() { [[ "$(head -c3 "$1" 2>/dev/null)" == $'\xef\xbb\xbf' ]]; }
 
@@ -565,11 +584,26 @@ cyr_sed_build
 _st_cyr() { LC_ALL=C sed -b -E "${CYR_SED[@]}"; }
 _st_cyr2() { LC_ALL=C sed -b -E "${CYR2_SED[@]}"; }
 SHY_OTHER=$'(\xc2[\x98\xa0\xa4\xa6\xa7\xa9\xab\xac\xae]|\xe2\x80[\x93\x94\x98-\x9a\x9c-\x9e\xa0-\xa2\xa6\xb0\xb9\xba]|\xe2\x82\xac|\xe2\x84\xa2|'"${DOS_GS}|${DOS_GB}|${DOS_GU}"')'
-SHY_L=$'([A-Za-z]|\xd0[\x81\x90-\xbf]|\xd1[\x80-\x8f\x91])'
-SHY_LL=$'([A-Za-z]|\xd0[\x81\x90\x91\xb0-\xbf]|\xd1[\x80-\x8f\x91])'
+SHY_L=$'([A-Za-z]|\xd0[\x81\x86\x90-\xbf]|\xd1[\x80-\x8f\x91\x94\x96\x97\x9e]|\xd2\x91)'
+SHY_LL=$'([A-Za-z]|\xd0[\x81\x86\x90\x91\xb0-\xbf]|\xd1[\x80-\x8f\x91\x94\x96\x97\x9e]|\xd2\x91)'
 SHY_RE="${SHY_LL}"$'\xc2\xad'"${SHY_L}"
-_st_shy() { LC_ALL=C sed -b -E -e "/${SHY_OTHER}/b" -e ':a' -e "s/${SHY_LL}"$'\xc2\xad'"${SHY_L}/\\1\\2/" -e 'ta'; }
-_shy_sel() { LC_ALL=C grep -a -E "$SHY_RE" | LC_ALL=C grep -a -v -E "$SHY_OTHER"; }
+SHY_L1=$'\xc3[\x80-\x96\x98-\xb6\xb8-\xbf]'
+SHY_LX="(${SHY_L:1:${#SHY_L}-2}|${SHY_L1})"
+SHY_LLX="(${SHY_LL:1:${#SHY_LL}-2}|${SHY_L1})"
+_shy_west() { (( ${west_all:-0} > 0 )) && ${do_moji:-false}; }
+_st_shy() {
+    local l="$SHY_L" ll="$SHY_LL"
+    _shy_west && { l="$SHY_LX"; ll="$SHY_LLX"; }
+    LC_ALL=C sed -b -E -e "/${SHY_OTHER}/b" -e ':a' -e "s/${ll}"$'\xc2\xad'"${l}/\\1\\2/" -e 'ta'
+}
+_shy_sel() {
+    local re="$SHY_RE"
+    _shy_west && re="${SHY_LLX}"$'\xc2\xad'"${SHY_LX}"
+    LC_ALL=C grep -a -E "$re" | LC_ALL=C grep -a -v -E "$SHY_OTHER"
+}
+SHY8_RE=$'^([\x01-\x7f]|[A-Za-z](\xad[A-Za-z])+)*$'
+_st_shy8() { LC_ALL=C sed -b -E -e $'/\xad/!b' -e "/${SHY8_RE}/s/"$'\xad'"//g"; }
+_shy8_sel() { LC_ALL=C grep -a $'\xad' | LC_ALL=C grep -a -E "$SHY8_RE"; }
 _st_dos_sel() { LC_ALL=C sed -n -b -E "${DOS_SEL[@]}"; }
 _st_u8_sel() { LC_ALL=C sed -n -b -E "${U8_SEL[@]}"; }
 _st_dosp() { LC_ALL=C sed -b -E "${DOSP_SED[@]}"; }
@@ -637,7 +671,7 @@ _koi_cands() { LC_ALL=C grep -a -E "$KOI_RE" -- "$1" 2>/dev/null; }
 _koi_awk() { LC_ALL=C awk -v BINMODE=3 -v mode="$1" -v bi="$KOI_BI" "$KOI_AWK"; }
 # KOI8-R text read as Windows-1251: only if most all-caps lines of the file look so.
 KOI_ALL=0; KOI_REST=0
-detect_koi() {
+_detect_koi() {
     local cand=0 vote=0 lines=0
     KOI_ALL=0; KOI_REST=0
     read -r cand vote lines < <(_koi_cands "$1" | head -n 200000 | _koi_awk count)
@@ -651,8 +685,106 @@ detect_koi() {
     KOI_ALL=$vote; KOI_REST=$(( cand - vote ))
     return 0
 }
+WEST_L=$'(\xd1[\x86\x88\x8c]|\xd0[\x94\x97\x98\x99\xa6\xa8\xac\xaf\xb4\xb7\xb8\xb9])'
+WEST_LINE=$'^([\t\x20-\x7e]|'"${WEST_L}"$')+\r?$'
+WEST_AE=$'\xd0[\x96\xb6]'
+WEST_LX=$'(\xd1[\x86\x88\x8c]|\xd0[\x94\x96\x97\x98\x99\xa6\xa8\xac\xaf\xb4\xb6\xb7\xb8\xb9])'
+WEST_LINEX=$'^([\t\x20-\x7e]|\xc2\xad|'"${WEST_LX}"$')+\r?$'
+declare -a WEST_SEL=() WEST_SELX=() WEST_SED=()
+WEST_SEL=(-e "/${WEST_LINE}/"'!b' -e '/([A-Za-z].*){3}/!b' -e "/[0-9]${WEST_L}/b"
+          -e "/(^|[^A-Za-z"$'\x80-\xbf'"])${WEST_L}([^A-Za-z"$'\xd0\xd1'"]|\$)/b"
+          -e "/(^|[^A-Za-z"$'\x80-\xbf'"])${WEST_L}${WEST_L}([^A-Za-z"$'\xd0\xd1'"]|\$)/b"
+          -e "/${WEST_L}${WEST_L}${WEST_L}/b")
+WEST_SELX=(-e "/${WEST_LINEX}/"'!b' -e '/([A-Za-z].*){3}/!b' -e "/[0-9]${WEST_LX}/b"
+          -e "/(^|[^A-Za-z"$'\x80-\xbf'"])${WEST_LX}([^A-Za-z"$'\xd0\xd1'"]|\$)/b"
+          -e "/(^|[^A-Za-z"$'\x80-\xbf'"])${WEST_LX}${WEST_LX}([^A-Za-z"$'\xd0\xd1'"]|\$)/b"
+          -e "/${WEST_LX}${WEST_LX}${WEST_LX}/b"
+          -e "/(^|[^A-Za-z"$'\x80-\xbf'"])${WEST_AE}/b" -e "/${WEST_AE}[0-9]/b")
+WEST_SED=("${WEST_SELX[@]}"
+          -e $'s/\xd0\xb6/\xc3\xa6/g' -e $'s/\xd0\x96/\xc3\x86/g'
+          -e $'s/\xd1\x8c/\xc3\xbc/g' -e $'s/\xd1\x86/\xc3\xb6/g' -e $'s/\xd0\xb4/\xc3\xa4/g' -e $'s/\xd0\xb9/\xc3\xa9/g'
+          -e $'s/\xd0\xb8/\xc3\xa8/g' -e $'s/\xd0\xb7/\xc3\xa7/g' -e $'s/\xd0\xaf/\xc3\x9f/g' -e $'s/\xd1\x88/\xc3\xb8/g'
+          -e $'s/\xd0\xac/\xc3\x9c/g' -e $'s/\xd0\xa6/\xc3\x96/g' -e $'s/\xd0\x94/\xc3\x84/g' -e $'s/\xd0\x99/\xc3\x89/g'
+          -e $'s/\xd0\x98/\xc3\x88/g' -e $'s/\xd0\x97/\xc3\x87/g' -e $'s/\xd0\xa8/\xc3\x98/g')
+# Western (Windows-1252) text read as Windows-1251 back to normal letters.
+_st_west() { LC_ALL=C sed -b -E "${WEST_SED[@]}"; }
+_st_west_sel() { LC_ALL=C sed -n -b -E "${WEST_SELX[@]}" -e p; }
+_st_west_sel1() { LC_ALL=C sed -n -b -E "${WEST_SEL[@]}" -e p; }
+WEST_ALL=0
+# Western (Windows-1252) text read as Windows-1251: recognize the file, count the lines.
+_detect_west() {
+    local w m
+    WEST_ALL=0
+    if pq_take westw "$1"; then w=$REPLY; else
+        w="$(LC_ALL=C grep -a -E "$WEST_L" -- "$1" 2>/dev/null | _st_west_sel1 | LC_ALL=C grep -a -c '')"
+    fi
+    [[ "$w" =~ ^[0-9]+$ ]] && (( w >= 20 )) || return 0
+    if pq_take westm "$1"; then m=$REPLY; else
+        m="$(LC_ALL=C grep -a -E $'[\xd0\xd1][\x80-\xbf]' -- "$1" 2>/dev/null | LC_ALL=C grep -a -c '[A-Za-z]')"
+    fi
+    [[ "$m" =~ ^[0-9]+$ ]] || return 0
+    (( w * 100 >= m * 5 )) || return 0
+    WEST_ALL="$(LC_ALL=C grep -a -E "$WEST_LX" -- "$1" 2>/dev/null | _st_west_sel | LC_ALL=C grep -a -c '')"
+    [[ "$WEST_ALL" =~ ^[0-9]+$ ]] || WEST_ALL=$w
+    return 0
+}
+
+declare -a CESU_SED=()
+CESU_SEQ="" CESU_LINE=""
+hex2bytes() { local h="$1" e=""; while [[ -n "$h" ]]; do e+="\\x${h:0:2}"; h="${h:2}"; done; printf -v REPLY '%b' "$e"; }
+# Regular expressions for CESU-8 emoji read as Windows-1251 (built at startup).
+cesu_re_build() {
+    local p x="" y="" z="" n
+    printf -v n '%b' '\xd0\xbd'
+    for p in $W1251_HI; do
+        hex2bytes "${p#*:}"
+        case "${p%%:*}" in a?) x+="${x:+|}$REPLY" ;; b?) z+="${z:+|}$REPLY" ;; esac
+        y+="${y:+|}$REPLY"
+    done
+    CESU_SEQ="${n}(${x})(${y})${n}(${z})(${y})"
+    CESU_LINE=$'^([\t\x20-\x7e]|'"${CESU_SEQ}"$')+\r?$'
+}
+cesu_re_build
+# The sed table for CESU-8 emoji read as Windows-1251 (built only when such lines exist).
+cesu_sed_build() {
+    local p xb yb zb wb q u n s r hx hy
+    local -A ch=()
+    (( ${#CESU_SED[@]} > 0 )) && return 0
+    for p in $W1251_HI; do hex2bytes "${p#*:}"; ch[${p%%:*}]="$REPLY"; done
+    printf -v n '%b' '\xd0\xbd'
+    CESU_SED=(-e "/${CESU_LINE}/"'!b')
+    for (( xb = 0xa0; xb <= 0xaf; xb++ )); do
+        printf -v hx '%02x' "$xb"
+        for (( yb = 0x80; yb <= 0xbf; yb++ )); do
+            printf -v hy '%02x' "$yb"
+            u=$(( (((xb & 0x0f) << 6) | (yb & 0x3f)) + 64 ))
+            printf -v r '\\x02\\x%02x\\x%02x\\x%02x' $(( 0xf0 | (u >> 8) )) $(( 0x80 | ((u >> 2) & 0x3f) )) $(( 4 + (u & 3) ))
+            printf -v r '%b' "$r"
+            CESU_SED+=(-e "s/${n}${ch[$hx]}${ch[$hy]}/${r}/g")
+        done
+    done
+    for (( q = 0; q < 4; q++ )); do
+        printf -v s '\\x%02x' $(( 4 + q )); printf -v s '%b' "$s"
+        for (( zb = 0xb0; zb <= 0xbf; zb++ )); do
+            printf -v hx '%02x' "$zb"
+            printf -v r '\\x%02x\\x03' $(( 0x80 | (q << 4) | (zb & 0x0f) ))
+            printf -v r '%b' "$r"
+            CESU_SED+=(-e "s/${s}${n}${ch[$hx]}/${r}/g")
+        done
+    done
+    for (( wb = 0x80; wb <= 0xbf; wb++ )); do
+        printf -v hx '%02x' "$wb"
+        printf -v r '\\x%02x' "$wb"; printf -v r '%b' "$r"
+        CESU_SED+=(-e $'s/\x03'"${ch[$hx]}/${r}/g")
+    done
+    CESU_SED+=(-e $'s/\x02//g')
+}
+_st_cesu() { LC_ALL=C sed -b -E "${CESU_SED[@]}"; }
+
 _st_unmoji() {
-    _st_moji | _st_cyr \
+    { if (( ${west_all:-0} > 0 )); then _st_west; else cat; fi; } \
+        | { if (( ${cesu_all:-0} > 0 )); then _st_cesu; else cat; fi; } \
+        | _st_moji | _st_cyr \
         | { if (( ${moji_all:-0} + ${u8_all:-0} > 0 )); then _st_moji | _st_cyr2; else cat; fi; } \
         | { if (( ${dosp_all:-0} > 0 )); then _st_dosp; else cat; fi; } \
         | { if (( ${koi_all:-0} > 0 )); then _st_koi; else cat; fi; } \
@@ -732,8 +864,9 @@ show_help_ru() {
     echo "  ./${SCRIPT_NAME} --help | -h   эта справка"
     echo "  ./${SCRIPT_NAME} --version     показать версию и выйти"
     echo "  ./${SCRIPT_NAME} --lang en     интерфейс по-английски (--lang ru — по-русски)"
+    echo "  ./${SCRIPT_NAME} --recheck …   пересчитать проверки, не брать прежние числа"
     echo "  Язык сам выбирается по языку системы (в Git Bash и WSL — по языку Windows)."
-    echo "  Пункт 8 меню «Язык / Language» меняет его и запоминает выбор; ещё можно"
+    echo "  Пункт 10 меню «Язык / Language» меняет его и запоминает выбор; ещё можно"
     echo "  задать переменную DEDUP_LANG=ru или en."
     echo "  Первый запуск в Windows: dedup_tool_first_windows_start.bat рядом со скриптом —"
     echo "  двойное нажатие. Он найдёт Git for Windows (нет — предложит установить) и"
@@ -752,14 +885,16 @@ show_help_ru() {
     echo "     в пункт 1. Пункт 2, а потом 3 на <имя>_prep.txt — то же, что пункт 1."
     echo "     Если в файле есть такой мусор или строки не в UTF-8, скрипт предупредит."
     echo "  4  Несколько словарей по очереди → <имя>_final.txt у каждого. Каждый файл —"
-    echo "     как пункт 1, но чистится и от итогов всех предыдущих: первый остаётся"
-    echo "     целым, в следующих нет строк, которые уже были раньше. Список идёт от"
-    echo "     большого файла к меньшему. Порядок — номера через пробел (3 1 2), Enter —"
-    echo "     все по списку, кроме итогов _final, файлов объединения и убранных строк"
-    echo "     (_short, _digits, _notutf8); перед началом его покажут ещё раз."
+    echo "     подготовка и без повторов, как в пункте 1, и чистится от итогов всех"
+    echo "     предыдущих: первый остаётся целым, в следующих нет строк, которые уже были"
+    echo "     раньше. Словари чистятся только друг от друга: эталоны из '$COMPARE_DIR/'"
+    echo "     очередь не берёт, с ними — пункт 1. Список — от большого файла к меньшему."
+    echo "     Порядок — номера через пробел (3 1 2), Enter — все по списку, кроме итогов"
+    echo "     _final, файлов объединения, убранных строк (_short, _digits, _notutf8) и"
+    echo "     файлов утилит пункта 7 (_emails, _rest, _logins…; _prep — берётся); перед"
+    echo "     началом его покажут ещё раз."
     echo "     Вопросы — один раз: для следующих файлов берётся тот же ответ. Итоги"
-    echo "     остаются в рабочей папке, в '$COMPARE_DIR/' ничего не добавляется;"
-    echo "     эталонов может и не быть — тогда файлы чистятся только друг от друга."
+    echo "     остаются в рабочей папке, в '$COMPARE_DIR/' ничего не добавляется."
     echo "     Когда очередь пройдена целиком, исходные словари уходят в новую папку"
     echo "     originals_<дата-время>/ — в рабочей папке остаются итоги."
     echo "  5  Объединить файлы в один без повторов → merged.txt (если есть — merged_2.txt"
@@ -770,9 +905,10 @@ show_help_ru() {
     echo "     (Enter — нет), чтобы в папке остался только результат."
     echo "  6  Разделить готовый файл на части → папка <имя>_parts/"
     echo "  7  Работа со словарями: логины, раскладка, регистр, алфавиты, поиск — см. ниже"
-    echo "  8  Язык / Language"
+    echo "  8  Анализ словаря: только чтение — из чего он и что с ним делать (см. ниже)"
     echo "  9  Временные файлы и память для сортировки — см. «Большие словари»"
-    echo "  10 Справка      0  Выход"
+    echo "  10 Язык / Language"
+    echo "  11 Справка      0  Выход"
     echo "  Если рабочий файл — копия эталона из '$COMPARE_DIR/', скрипт предупредит до"
     echo "  вопросов: такой файл сравнится сам с собой, и его итог будет пустым."
     echo "  Если файл — архив под видом .txt (gzip, zip, 7z, rar, bzip2, xz, zstd),"
@@ -783,6 +919,26 @@ show_help_ru() {
     echo "  Промежуточных файлов нет: пункты 1, 3 и 4 идут одним проходом от входа до"
     echo "  итога, на диск пишется только <имя>_final.txt. Нужен файл после подготовки —"
     echo "  это пункт 2."
+    echo
+    echo -e "${GREEN}─── Анализ словаря (пункт 8) ──────────────────────────────${NC}"
+    echo "  Только чтение: файл не меняется, на диск пишется только лог (и прежние числа"
+    echo "  проверок, см. ниже). Те же проверки,"
+    echo "  что у пункта 2 до вопросов (кодировка, кракозябры, невидимые знаки, мусор), и"
+    echo "  проход без записи с ответами по умолчанию: сколько строк осталось бы и из чего"
+    echo "  словарь — длина, строки из цифр, буквы и знаки, почта, user:pass, ссылки, IP,"
+    echo "  алфавиты (языки так не различить: английское слово от транслита не отличить)."
+    echo "  Повторы не считаются: для этого нужна сортировка, а анализ на диск не пишет."
+    echo "  Потом — что делать по порядку и что запустить сразу: пункт 2 или 1 с теми же"
+    echo "  ответами (длину и цифры спросит) или утилиту 7.11. Можно выбрать несколько"
+    echo "  файлов («a» — все): тогда только отчёты."
+    echo
+    echo -e "${GREEN}─── Прежние числа проверок ─────────────────────────────────${NC}"
+    echo "  У файлов от 8 МБ счёт проверок до вопросов (пункты 1, 2, 4 и 8) и у анализа —"
+    echo "  счёт прохода запоминается в logs/.dedup_cache: полный путь, точный размер, время"
+    echo "  изменения, версия скрипта. Если файл с тех пор не менялся, скрипт пишет"
+    echo "  «Проверено … — беру прежние числа» и не читает файл заново; повторный анализ —"
+    echo "  без прохода. Проход подготовки и всё, что зависит от ответов, — всегда заново."
+    echo "  Пересчитать — запуск с ключом --recheck (или DEDUP_RECHECK=1)."
     echo
     echo -e "${GREEN}─── Подготовка (пункты 1, 2 и 4) ──────────────────────────${NC}"
     echo "  Сначала все вопросы — ответы только запоминаются. Потом файл ОДИН раз"
@@ -813,7 +969,12 @@ show_help_ru() {
     echo "        переведено, короткое — чаще;"
     echo "      – русский текст в DOS (CP866) без старшего бита: «а» стала пробелом, другие"
     echo "        буквы — знаками. Узнаётся по всему файлу, а не по строке; настоящие дефис"
-    echo "        и пробел станут буквами, строки с цифрами и латиницей не трогаются."
+    echo "        и пробел станут буквами, строки с цифрами и латиницей не трогаются;"
+    echo "      – западный текст (немецкий, французский…) в Windows-1252 как Windows-1251:"
+    echo "        «Mьller» → «Müller». Только ü ö ä é è ç ß ø æ и заглавные среди латиницы и"
+    echo "        только если таких строк в файле много: одна такая буква — обычный пароль;"
+    echo "      – эмодзи в CESU-8 (так пишут Java и часть программ Windows) как"
+    echo "        Windows-1251: шесть знаков «н Ѕн…» → один знак-эмодзи."
     echo "     Текст, испорченный дважды, восстанавливается вторым кругом сразу. Строка,"
     echo "     обрезанная посреди буквы (так бывает с названиями сетей Wi-Fi), получает"
     echo "     полные буквы, а половина последней отбрасывается."
@@ -828,6 +989,11 @@ show_help_ru() {
     echo "     UTF-8 (смешанный файл) — спросит, перекодировать ли только строки не в"
     echo "     UTF-8 (Enter: ДА); остальные не трогаются. В редакторе эти кодировки —"
     echo "     «Кириллица (Windows)», «Кириллица (KOI8-R)», «Кириллица (DOS)»."
+    echo "     Если кодировок в файле несколько и одной на весь не подобрать — спросит,"
+    echo "     перевести ли каждую строку из её кодировки  [Enter: ДА, если по выборке"
+    echo "     похожих на русский от половины]. Какая — решают сочетания русских букв;"
+    echo "     в WINDOWS-1251 — ещё белорусских и украинских і ў ї є ґ (с 1.2.26);"
+    echo "     западная строка — из WINDOWS-1252. Что не определить, уберёт проверка UTF-8."
     echo "   • Проверка UTF-8   [Enter: НЕТ; если UTF-16 не сконвертирован или"
     echo "     кодировка найдена — ДА]"
     echo "     Можно указать исходную кодировку (например WINDOWS-1251, KOI8-R, CP866,"
@@ -840,14 +1006,16 @@ show_help_ru() {
     echo "     Сколько таких строк и примеры — до вопроса. Если кодировка не определилась,"
     echo "     до вопроса будет сказано, сколько строк не в UTF-8 уберёт проверка, какая"
     echo "     это доля файла и на что они похожи (по выборке со всего файла). Смесь"
-    echo "     кодировок одной не перевести: их стоит сохранить в <имя>_notutf8.txt и"
-    echo "     разобрать потом — пункт 2 с WINDOWS-1251, пункт 2 на его _prep с"
-    echo "     кракозябрами, утилита 7.10. Если не в UTF-8 почти весь файл, Enter у"
+    echo "     кодировок переводится по строкам (см. выше); что не перевелось, можно"
+    echo "     сохранить в <имя>_notutf8.txt. Если не в UTF-8 почти весь файл, Enter у"
     echo "     кодировки переспросит: иначе итог был бы пустым."
     echo "   • Мягкий перенос   [вопрос, только если найден; Enter: ДА]"
     echo "     Невидимый знак U+00AD внутри слова (отметка места переноса): с ним слово"
     echo "     не совпадёт с тем, что набирают. Убирается только между буквами и только"
     echo "     в строке без других знаков: в кракозябрах DOS этот знак — буква «н»."
+    echo "     С 1.2.26 — и байт AD внутри латинского слова, из-за которого строка не в"
+    echo "     UTF-8 (так перенос пишут Windows-1251, Windows-1252, Latin-1): тот же вопрос,"
+    echo "     раньше кириллицы; эти строки не идут в счёт строк не в UTF-8."
     echo "   • Пустые строки    [вопрос, только если найдены; Enter: ДА]"
     echo "     Пустые строки и строки из одних пробелов и табов. Строки с пробелами только"
     echo "     по краям слова не трогает: их считает проверка итога."
@@ -887,7 +1055,7 @@ show_help_ru() {
     echo "   4. Итог проверяется на строки с пробелами или табами в начале или в конце:"
     echo "      в редакторе их не видно, а «80808080 » и «80808080» — разные строки."
     echo "      Если такие есть — сколько их и сколько места, примеры — в логе. Вопроса нет:"
-    echo "      убрать или обрезать их — пункт 7, утилита 14."
+    echo "      убрать или обрезать их — пункт 7, утилита 15."
     echo
     echo -e "${GREEN}─── Деление (пункт 6) ──────────────────────────────────────${NC}"
     echo "  Число — столько частей (split -n l/N); размер с единицей K/M/G/T — части"
@@ -898,7 +1066,7 @@ show_help_ru() {
     echo "  дублей между частями."
     echo
     echo -e "${GREEN}─── Работа со словарями (пункт 7) ──────────────────────────${NC}"
-    echo "  Исходный файл не меняется (кроме утилиты 14, если попросить), результат — новый"
+    echo "  Исходный файл не меняется (кроме утилиты 15, если попросить), результат — новый"
     echo "  файл <имя>_<что>.txt (имя занято — _2). Логины, пароли, части строк и адреса — без"
     echo "  повторов и по порядку байтов; остальное — строка в строку, в прежнем порядке."
     echo "  После утилит 1–4 можно сохранить словарь без строк, из которых что-то извлечено:"
@@ -907,30 +1075,46 @@ show_help_ru() {
     echo "   2  user:pass → _logins и _passwords: строка делится по первому «:» или «;»"
     echo "   3  Любой разделитель (: / ; --- (at)): левая часть → _left, правая → _right;"
     echo "      правая — всё после первого разделителя"
-    echo "   4  Вырезать из дампа почту → _emails, ссылки → _urls, адреса IP → _ip"
+    echo "   4  Вырезать из дампа почту → _emails, ссылки → _urls, адреса IP → _ip, пары"
+    echo "      user:pass → _userpass (строка логин:пароль; из url:логин:пароль — логин:пароль),"
+    echo "      MAC → _mac (с разделителями : - или точкой, в виде aa:bb:cc:dd:ee:ff)"
     echo "   5  Раскладка: RU → EN («привет» → «ghbdtn») → _en, только строки с кириллицей;"
     echo "      EN → RU → _ru, только строки с латиницей"
     echo "   6  Регистр → _lower, _upper, _cap (первая большая), _uncap (первая маленькая)"
     echo "      или все четыре файла сразу"
     echo "   7  Строки с пробелом или табом: убрать → _nospace, первое слово → _firstword"
     echo "   8  Обрезать пробелы и табы по краям, сдвоенные внутри — в один → _trim"
-    echo "   9  Убрать строки с заданными кусками (через пробел: - _ admin) → _filtered."
-    echo "      Строка уходит, если есть хоть один кусок; «-admin» — один кусок, «- admin» — два"
-    echo "  10  По алфавитам: _latin (и ASCII), _cyr, _greek, _hebrew, _arabic, _cjk, _other;"
+    echo "   9  Отбор строк: убрать строки с заданными кусками (через пробел: - _ admin) →"
+    echo "      _filtered; строка уходит, если есть хоть один кусок; «-admin» — один кусок,"
+    echo "      «- admin» — два. Ещё целыми строками или регулярным выражением; оставить"
+    echo "      только такие строки → _kept; большие и маленькие буквы — различать или нет;"
+    echo "      убранные строки — по желанию в _removed"
+    echo "  10  Транслит: русские буквы латиницей, как набирают в паролях («привет» → «privet»,"
+    echo "      «щука» → «schuka», ъ и ь выпадают) → _translit, только строки с кириллицей"
+    echo "  11  По алфавитам: _latin (и ASCII), _cyr, _greek, _hebrew, _arabic, _cjk, _other;"
     echo "      цифры и знаки алфавит не меняют, два алфавита в строке — _mixed"
-    echo "  11  Самые частые строки → _top: сколько раз, для нескольких файлов — и в скольких."
+    echo "  12  Самые частые строки → _top: сколько раз, для нескольких файлов — и в скольких."
     echo "      Если у конца списка счётчик тот же, что и за ним, скрипт об этом скажет"
-    echo "  12  Повторы без сортировки, порядок прежний → _uniq; память и диск — как у"
-    echo "      сортировки, времени вдвое больше"
-    echo "  13  Найти строку в *.txt папки и в эталонах: где и сколько раз, только счёт."
+    echo "  13  Повторы без сортировки, порядок прежний → _uniq; память и диск — как у"
+    echo "      сортировки, времени вдвое больше. Ещё без учёта больших и маленьких букв →"
+    echo "      _uniq_nocase или по части строки до разделителя (одна строка на логин в"
+    echo "      user:pass) → _uniq_left"
+    echo "  14  Найти строку в *.txt папки и в эталонах: где и сколько раз, только счёт."
     echo "      Поиск по байтам: словарь в другой кодировке так не найти
-  14  Пробелы и табы по краям: вынести такие строки → _edge и убрать из словаря → _noedge,
+  15  Пробелы и табы по краям: вынести такие строки → _edge и убрать из словаря → _noedge,
       обрезать справа → _rtrim, обрезать слева → _ltrim. Можно заменить сам файл
       [вопрос, Enter: НЕТ]: только через временный файл, после успешной записи.
       Отсортированный файл после обрезки сортируется заново; с эталонами заново не
       сверяется
-  15  Убрать из файла строки других словарей → _minus, отсортированный и без повторов.
-      Словари — *.txt этой папки и эталоны, без подготовки: снимаются только CRLF и BOM"
+  16  Убрать из файла строки других словарей → _minus, отсортированный и без повторов.
+      Словари — *.txt этой папки и эталоны, без подготовки: снимаются только CRLF и BOM
+  17  Оставить только общие строки: есть хотя бы в одном из других словарей или во всех
+      → _common, отсортированный и без повторов (обратная к 16)
+  18  Упорядочить: по частоте (каждая строка один раз, частые первыми) → _byfreq, по
+      длине в буквах → _bylen, сначала длинные → _bylen_desc
+  19  Случайный порядок строк → _shuffled (например, для выборки из словаря)
+  В списках файлов у результатов утилит — пометка «← утилита 7.N: что», если исходный
+  файл лежит рядом."
     echo "  Раскладка, регистр и алфавиты ждут UTF-8: иначе сначала пункт 2."
     echo
     echo -e "${GREEN}─── WSL и диски Windows ───────────────────────────────────${NC}"
@@ -982,14 +1166,18 @@ show_help_ru() {
     echo "  ./${SCRIPT_NAME} compare [file...]        = пункт 3 (без файлов — все *.txt папки)"
     echo "  ./${SCRIPT_NAME} split <file> <N|размер>  = пункт 6"
     echo "  ./${SCRIPT_NAME} queue <file1> <file2>... = пункт 4, файлы в этом порядке"
+    echo "  ./${SCRIPT_NAME} analyze <file>...        = пункт 8"
     echo "  ./${SCRIPT_NAME} merge [file...]          = пункт 5 (без файлов — все итоги _final)"
-    echo "  ./${SCRIPT_NAME} tool logins|userpass|trim|alphabets|uniq <file>  = пункт 7"
+    echo "  ./${SCRIPT_NAME} tool logins|userpass|trim|alphabets|shuffle|translit <file>  = пункт 7"
+    echo "  ./${SCRIPT_NAME} tool uniq <file> [--nocase] [--left <разделитель>]"
     echo "  ./${SCRIPT_NAME} tool cut <file> <разделитель> [left|right|both]"
-    echo "  ./${SCRIPT_NAME} tool extract <file> [emails] [urls] [ip]"
+    echo "  ./${SCRIPT_NAME} tool extract <file> [emails] [urls] [ip] [userpass] [mac]"
     echo "  ./${SCRIPT_NAME} tool layout <file> [ru2en|en2ru]"
     echo "  ./${SCRIPT_NAME} tool case <file> lower|upper|cap|uncap|all"
     echo "  ./${SCRIPT_NAME} tool spaces <file> remove|first"
-    echo "  ./${SCRIPT_NAME} tool filter <file> <кусок>..."
+    echo "  ./${SCRIPT_NAME} tool filter <file> [--keep] [--line|--regex] [--icase] [--save] <кусок>..."
+    echo "  ./${SCRIPT_NAME} tool order <file> freq|len|lenrev"
+    echo "  ./${SCRIPT_NAME} tool common <file> [--all] <словарь>..."
     echo "  ./${SCRIPT_NAME} tool top [N] <file>..."
     echo "  ./${SCRIPT_NAME} tool find <строка> [file...]"
     echo "  ./${SCRIPT_NAME} tool edge <file> move|right|left [replace]"
@@ -1011,7 +1199,7 @@ show_help_ru() {
     echo "  а с </dev/null у всех вопросов будет вариант по умолчанию."
     echo
     echo -e "${RED}Предупреждение:${NC} эталоны с вашего согласия исправляются на месте или переносятся"
-    echo "  в ${UNSORTED_DIR}/. Рабочие файлы скрипт не меняет, кроме утилиты 14, если вы попросите"
+    echo "  в ${UNSORTED_DIR}/. Рабочие файлы скрипт не меняет, кроме утилиты 15, если вы попросите"
     echo "  заменить файл; после очереди (пункт 4) исходные словари переносятся в папку"
     echo "  originals_<дата-время>/. Делайте бэкап эталонов."
     echo
@@ -1029,8 +1217,9 @@ show_help_en() {
     echo "  ./${SCRIPT_NAME} --help | -h   this help"
     echo "  ./${SCRIPT_NAME} --version     show the version and exit"
     echo "  ./${SCRIPT_NAME} --lang ru     Russian interface (--lang en — English)"
+    echo "  ./${SCRIPT_NAME} --recheck …   recount the checks, do not use the earlier numbers"
     echo "  The language follows the system language (in Git Bash and WSL — the Windows"
-    echo "  language). Menu item 8 \"Language / Язык\" changes it and remembers the choice;"
+    echo "  language). Menu item 10 \"Language / Язык\" changes it and remembers the choice;"
     echo "  the DEDUP_LANG=ru or en variable works too."
     echo "  First start on Windows: double-click dedup_tool_first_windows_start.bat next"
     echo "  to the script. It finds Git for Windows (if it is missing, offers to install it)"
@@ -1050,15 +1239,17 @@ show_help_en() {
     echo "     is the same as item 1. If the file has such garbage or lines that are"
     echo "     not UTF-8, the script warns."
     echo "  4  Several dictionaries in a queue → <name>_final.txt for each. Each file is"
-    echo "     processed like item 1 but is also cleaned of the results of all previous"
-    echo "     ones: the first stays whole, the next ones have no lines seen earlier."
+    echo "     prepared and freed of duplicates as in item 1 and cleaned of the results of"
+    echo "     all previous ones: the first stays whole, the next ones have no lines seen"
+    echo "     earlier. The dictionaries are cleaned of each other only: the queue does"
+    echo "     not use the references from '$COMPARE_DIR/', item 1 does."
     echo "     The list goes from the biggest file to the smallest. Order — numbers"
     echo "     separated by spaces (3 1 2); Enter — all in the list except _final results,"
-    echo "     merge files and removed lines (_short, _digits, _notutf8); the order is"
-    echo "     shown once more before the start."
+    echo "     merge files, removed lines (_short, _digits, _notutf8) and item 7 tool"
+    echo "     files (_emails, _rest, _logins…; _prep is taken); the order is shown once"
+    echo "     more before the start."
     echo "     Questions are asked once: the next files get the same answers. Results"
-    echo "     stay in the working folder, nothing is added to '$COMPARE_DIR/';"
-    echo "     there may be no references — then the files are cleaned of each other."
+    echo "     stay in the working folder, nothing is added to '$COMPARE_DIR/'."
     echo "     When the whole queue is done, the source dictionaries move to a new"
     echo "     folder originals_<date-time>/ — the results stay in the working folder."
     echo "  5  Merge files into one without duplicates → merged.txt (if it exists —"
@@ -1069,9 +1260,10 @@ show_help_en() {
     echo "     originals_<date-time>/ (Enter — no), so that only the result stays."
     echo "  6  Split a finished file into parts → folder <name>_parts/"
     echo "  7  Dictionary tools: logins, keyboard layout, case, alphabets, search — see below"
-    echo "  8  Language / Язык"
+    echo "  8  Dictionary analysis: read only — what it is made of and what to do (below)"
     echo "  9  Temp files and memory for sorting — see «Big dictionaries»"
-    echo "  10 Help      0  Exit"
+    echo "  10 Language / Язык"
+    echo "  11 Help      0  Exit"
     echo "  If a working file is a copy of a reference from '$COMPARE_DIR/', the script"
     echo "  warns before the questions: such a file is compared with itself, and its"
     echo "  result is empty."
@@ -1085,6 +1277,27 @@ show_help_en() {
     echo "  There are no intermediate files: items 1, 3 and 4 run in one pass from the"
     echo "  input to the result, only <name>_final.txt is written. For the file after"
     echo "  preparation use item 2."
+    echo
+    echo -e "${GREEN}─── Dictionary analysis (item 8) ──────────────────────────${NC}"
+    echo "  Read only: the file is unchanged, only the log is written. The same checks as"
+    echo "  item 2 makes before its questions (encoding, mojibake, invisible characters,"
+    echo "  garbage) and a pass without writing with the default answers: how many lines"
+    echo "  would be left and what the dictionary is made of — length, digit lines,"
+    echo "  letters and signs, emails, user:pass, links, IP, alphabets (languages cannot"
+    echo "  be told this way: an English word looks like a transliteration). Duplicates"
+    echo "  are not counted: that needs sorting, and the analysis writes nothing to disk."
+    echo "  Then what to do, in order, and what to run right away: item 2 or 1 with the"
+    echo "  same answers (length and digits are asked) or tool 7.11. You can choose"
+    echo "  several files («a» — all): then only the reports."
+    echo
+    echo -e "${GREEN}─── Earlier check numbers ──────────────────────────────────${NC}"
+    echo "  For files from 8 MB the counts of the checks before the questions (items 1, 2,"
+    echo "  4 and 8) and, for the analysis, the counts of its pass are saved to"
+    echo "  logs/.dedup_cache: full path, exact size, modification time, script version. If"
+    echo "  the file has not changed since, the script says «Checked … — the earlier numbers"
+    echo "  are used» and does not read the file again; a repeated analysis has no pass."
+    echo "  The preparation pass and everything that depends on the answers is always new."
+    echo "  To recount, run with --recheck (or DEDUP_RECHECK=1)."
     echo
     echo -e "${GREEN}─── Preparation (items 1, 2 and 4) ────────────────────────${NC}"
     echo "  First all questions — answers are only remembered. Then the file goes ONCE"
@@ -1116,7 +1329,12 @@ show_help_en() {
     echo "        real word in capitals is sometimes converted too, a short one more often;"
     echo "      – Russian DOS text (CP866) without the high bit: «а» became a space, other"
     echo "        letters became signs. Detected by the whole file, not by a line; real"
-    echo "        hyphens and spaces become letters, lines with digits or Latin stay as is."
+    echo "        hyphens and spaces become letters, lines with digits or Latin stay as is;"
+    echo "      – Western text (German, French…) in Windows-1252 read as Windows-1251:"
+    echo "        «Mьller» → «Müller». Only ü ö ä é è ç ß ø æ and capitals among Latin letters,"
+    echo "        and only if the file has many such lines: one such letter is a password;"
+    echo "      – emoji in CESU-8 (as Java and some Windows programs write them) read as"
+    echo "        Windows-1251: six characters «н Ѕн…» → one emoji."
     echo "     Text spoiled twice is restored by a second round at once. A line cut in"
     echo "     the middle of a letter (Wi-Fi network names, for example) gets its full"
     echo "     letters, and the half of the last one is dropped."
@@ -1132,6 +1350,11 @@ show_help_en() {
     echo "     script asks whether to convert only the non-UTF-8 lines (Enter: YES);"
     echo "     the others are not touched. In an editor these encodings are"
     echo "     \"Cyrillic (Windows)\", \"Cyrillic (KOI8-R)\", \"Cyrillic (DOS)\"."
+    echo "     If the file has several of them and no single one fits — asks whether to"
+    echo "     convert each line from its own encoding  [Enter: YES if at least half of a"
+    echo "     sample looks Russian]. Russian letter pairs decide which; a Western line"
+    echo "     (in WINDOWS-1251 also the Belarusian and Ukrainian і ў ї є ґ, since 1.2.26);"
+    echo "     goes from WINDOWS-1252. What cannot be told, the UTF-8 check removes."
     echo "   • UTF-8 check      [Enter: NO; if UTF-16 is not converted or an encoding"
     echo "     was found — YES]"
     echo "     You can give the source encoding (for example WINDOWS-1251, KOI8-R, CP866,"
@@ -1144,14 +1367,16 @@ show_help_en() {
     echo "     The count and examples come before the question. If the encoding was not"
     echo "     found, you are told before the question how many non-UTF-8 lines it removes,"
     echo "     what share of the file they are and what they look like (a sample over the"
-    echo "     whole file). A mix of encodings cannot be converted with one: save them to"
-    echo "     <name>_notutf8.txt and sort them out later — item 2 with WINDOWS-1251,"
-    echo "     item 2 on its _prep with mojibake, tool 7.10. If almost the whole file is"
+    echo "     whole file). A mix of encodings is converted line by line (see above); what"
+    echo "     is left can be saved to <name>_notutf8.txt. If almost the whole file is"
     echo "     not UTF-8, Enter at the encoding asks again: the result would be empty."
     echo "   • Soft hyphen      [asked only if found; Enter: YES]"
     echo "     The invisible U+00AD inside a word (a hyphenation mark): with it the word"
     echo "     does not match what people type. Removed only between letters and only in"
     echo "     a line without other such signs: in DOS mojibake this sign is the letter «н»."
+    echo "     Since 1.2.26 also the byte AD inside a Latin word that makes the line not"
+    echo "     UTF-8 (this is how Windows-1251, Windows-1252, Latin-1 write the hyphen): the"
+    echo "     same question, before Cyrillic; such lines do not count as not UTF-8."
     echo "   • Empty lines      [asked only if found; Enter: YES]"
     echo "     Empty lines and lines of only spaces and tabs. Lines with spaces only at the"
     echo "     edges of a word stay: the check of the result counts them."
@@ -1194,7 +1419,7 @@ show_help_en() {
     echo "      end: they are invisible in an editor, and «80808080 » and «80808080»"
     echo "      are different lines. If there are any — how many and how much space,"
     echo "      examples go to the log. No question: to remove or trim them use item 7,"
-    echo "      tool 14."
+    echo "      tool 15."
     echo
     echo -e "${GREEN}─── Split (item 6) ────────────────────────────────────────${NC}"
     echo "  A number — that many parts (split -n l/N); a size with a unit K/M/G/T —"
@@ -1205,7 +1430,7 @@ show_help_en() {
     echo "  without duplicates between parts."
     echo
     echo -e "${GREEN}─── Dictionary tools (item 7) ──────────────────────────────${NC}"
-    echo "  The source file stays unchanged (except tool 14, if you ask), the result is a new"
+    echo "  The source file stays unchanged (except tool 15, if you ask), the result is a new"
     echo "  file <name>_<what>.txt (if taken — _2). Logins, passwords, line parts and addresses"
     echo "  come without duplicates in byte order; the rest line for line, in the same order."
     echo "  After tools 1–4 you can save the dictionary without the lines something was"
@@ -1214,31 +1439,46 @@ show_help_en() {
     echo "   2  user:pass → _logins and _passwords: split at the first \":\" or \";\""
     echo "   3  Any separator (: / ; --- (at)): left part → _left, right part → _right;"
     echo "      the right part is everything after the first separator"
-    echo "   4  Cut out of a dump: emails → _emails, links → _urls, IP addresses → _ip"
+    echo "   4  Cut out of a dump: emails → _emails, links → _urls, IP addresses → _ip, user:pass"
+    echo "      pairs → _userpass (a login:password line; from url:login:password — login:password),"
+    echo "      MACs → _mac (with : - or dot separators, as aa:bb:cc:dd:ee:ff)"
     echo "   5  Keyboard layout: RU → EN («привет» → «ghbdtn») → _en, only lines with"
     echo "      Cyrillic; EN → RU → _ru, only lines with Latin letters"
     echo "   6  Case → _lower, _upper, _cap (first upper), _uncap (first lower)"
     echo "      or all four files at once"
     echo "   7  Lines with a space or tab: remove → _nospace, first word → _firstword"
     echo "   8  Trim spaces and tabs at the edges, double ones inside into one → _trim"
-    echo "   9  Remove lines with the given pieces (separated by spaces: - _ admin) → _filtered."
-    echo "      A line goes if it has at least one; «-admin» is one piece, «- admin» is two"
-    echo "  10  By alphabets: _latin (and ASCII), _cyr, _greek, _hebrew, _arabic, _cjk, _other;"
+    echo "   9  Filter lines: remove lines with the given pieces (separated by spaces: - _ admin)"
+    echo "      → _filtered; a line goes if it has at least one; «-admin» is one piece, «- admin»"
+    echo "      is two. Also whole lines or a regular expression; keep only such lines → _kept;"
+    echo "      upper and lower case — told apart or not; removed lines — optionally to _removed"
+    echo "  10  Transliteration: Russian letters in Latin, as typed in passwords («привет» → «privet»,"
+    echo "      «щука» → «schuka», ъ and ь are dropped) → _translit, only lines with Cyrillic"
+    echo "  11  By alphabets: _latin (and ASCII), _cyr, _greek, _hebrew, _arabic, _cjk, _other;"
     echo "      digits and signs do not count, two alphabets in a line — _mixed"
-    echo "  11  The most frequent lines → _top: how many times and, for several files, in how many."
+    echo "  12  The most frequent lines → _top: how many times and, for several files, in how many."
     echo "      If the end of the list has the same count as the lines after it, you are told"
-    echo "  12  Duplicates without sorting, the order kept → _uniq; memory and disk as for a"
-    echo "      sort, twice the time"
-    echo "  13  Find a line in the *.txt of the folder and in references: where and how many"
+    echo "  13  Duplicates without sorting, the order kept → _uniq; memory and disk as for a"
+    echo "      sort, twice the time. Also ignoring upper and lower case → _uniq_nocase, or by"
+    echo "      the part of a line before a separator (one line per login in user:pass) →"
+    echo "      _uniq_left"
+    echo "  14  Find a line in the *.txt of the folder and in references: where and how many"
     echo "      times, counts only. Byte search: a dictionary in another encoding is not found
-  14  Spaces and tabs at the edges: move such lines → _edge and remove them from the
+  15  Spaces and tabs at the edges: move such lines → _edge and remove them from the
       dictionary → _noedge, trim on the right → _rtrim, trim on the left → _ltrim. You can
       replace the file itself [question, Enter: NO]: only through a temporary file, after a
       successful write. A sorted file is sorted again after trimming; it is not compared
       with the references again
-  15  Remove from a file the lines of other dictionaries → _minus, sorted, without
+  16  Remove from a file the lines of other dictionaries → _minus, sorted, without
       duplicates. Dictionaries: *.txt of this folder and references, without preparation:
-      only CRLF and BOM are removed"
+      only CRLF and BOM are removed
+  17  Keep only the common lines: in at least one of the other dictionaries or in all of
+      them → _common, sorted, without duplicates (the reverse of 16)
+  18  Order: by frequency (each line once, frequent ones first) → _byfreq, by length in
+      characters → _bylen, the longest first → _bylen_desc
+  19  Random order of lines → _shuffled (for a sample of a dictionary, for example)
+  In the file lists, tool results are marked «← tool 7.N: what» if the source file is
+  next to them."
     echo "  Layout, case and alphabets expect UTF-8: otherwise use item 2 first."
     echo
     echo -e "${GREEN}─── WSL and Windows drives ────────────────────────────────${NC}"
@@ -1292,14 +1532,18 @@ show_help_en() {
     echo "  ./${SCRIPT_NAME} compare [file...]        = item 3 (without files — all *.txt of the folder)"
     echo "  ./${SCRIPT_NAME} split <file> <N|size>    = item 6"
     echo "  ./${SCRIPT_NAME} queue <file1> <file2>... = item 4, files in this order"
+    echo "  ./${SCRIPT_NAME} analyze <file>...        = item 8"
     echo "  ./${SCRIPT_NAME} merge [file...]          = item 5 (without files — all _final results)"
-    echo "  ./${SCRIPT_NAME} tool logins|userpass|trim|alphabets|uniq <file>  = item 7"
+    echo "  ./${SCRIPT_NAME} tool logins|userpass|trim|alphabets|shuffle|translit <file>  = item 7"
+    echo "  ./${SCRIPT_NAME} tool uniq <file> [--nocase] [--left <separator>]"
     echo "  ./${SCRIPT_NAME} tool cut <file> <separator> [left|right|both]"
-    echo "  ./${SCRIPT_NAME} tool extract <file> [emails] [urls] [ip]"
+    echo "  ./${SCRIPT_NAME} tool extract <file> [emails] [urls] [ip] [userpass] [mac]"
     echo "  ./${SCRIPT_NAME} tool layout <file> [ru2en|en2ru]"
     echo "  ./${SCRIPT_NAME} tool case <file> lower|upper|cap|uncap|all"
     echo "  ./${SCRIPT_NAME} tool spaces <file> remove|first"
-    echo "  ./${SCRIPT_NAME} tool filter <file> <piece>..."
+    echo "  ./${SCRIPT_NAME} tool filter <file> [--keep] [--line|--regex] [--icase] [--save] <piece>..."
+    echo "  ./${SCRIPT_NAME} tool order <file> freq|len|lenrev"
+    echo "  ./${SCRIPT_NAME} tool common <file> [--all] <dictionary>..."
     echo "  ./${SCRIPT_NAME} tool top [N] <file>..."
     echo "  ./${SCRIPT_NAME} tool find <line> [file...]"
     echo "  ./${SCRIPT_NAME} tool edge <file> move|right|left [replace]"
@@ -1321,7 +1565,7 @@ show_help_en() {
     echo "  be given through stdin, and with </dev/null every question gets its default."
     echo
     echo -e "${RED}Warning:${NC} with your consent references are fixed in place or moved to"
-    echo "  ${UNSORTED_DIR}/. The script does not change working files, except tool 14 if you ask"
+    echo "  ${UNSORTED_DIR}/. The script does not change working files, except tool 15 if you ask"
     echo "  to replace a file; after a queue (item 4) the source dictionaries move to"
     echo "  originals_<date-time>/. Back up your references."
     echo
@@ -1334,6 +1578,18 @@ confirm_action() {
     local prompt="$1" default="${2:-y}" key="${3:-$1}" tmo="${4:-}" yn hint="[Y/n]" rc ans how="" w_yes w_no w_memo m
     L w_yes да yes; L w_no нет no; L w_memo "(как раньше в этой очереди)" "(same as earlier in this queue)"
     [[ "$default" == "n" ]] && hint="[y/N]"
+    if $CONFIRM_AUTO; then
+        ans="$default"
+        if ! $PREP_ANALYZE; then
+            how="$w_yes"; [[ "$ans" == y ]] || how="$w_no"
+            L m "(как в анализе)" "(as in the analysis)"
+            printf '▐► %s → %s %b\n' "$prompt" "$how" "${BLUE}${m}${NC}"
+            log_line "? ${prompt} → ${how} ${m}"
+        fi
+        $MEMO_ON && MEMO_NEW[$key]="$ans"
+        [[ "$ans" == y ]]
+        return
+    fi
     if $MEMO_ON && [[ -n "${MEMO[$key]+x}" ]]; then
         ans="${MEMO[$key]}"
         how="$w_yes"; [[ "$ans" == y ]] || how="$w_no"
@@ -1393,6 +1649,16 @@ read_line() {
 ask_value() {
     local prompt="$1" def="${2:-}" v="" rc how="" key="v:$1" e
     local p="${prompt%%+( )}"
+    if $CONFIRM_AUTO; then
+        if ! $PREP_ANALYZE; then
+            L how "(как в анализе)" "(as in the analysis)"
+            printf '%s%s %b\n' "$prompt" "${def:-Enter}" "${BLUE}${how}${NC}"
+            L e пусто empty
+            log_line "? ${p%:} → ${def:-$e} ${how}"
+        fi
+        REPLY="$def"
+        return 0
+    fi
     if $MEMO_ON && [[ -n "${MEMO[$key]+x}" ]]; then
         v="${MEMO[$key]}"
         L how "(как раньше в этой очереди)" "(same as earlier in this queue)"
@@ -1735,8 +2001,60 @@ file_mark() {
     elif [[ "${1##*/}" =~ _short(_[0-9]+)?\.txt$ ]]; then L m '  ← убранные строки: короткие' '  ← removed lines: short'
     elif [[ "${1##*/}" =~ _digits(_[0-9]+)?\.txt$ ]]; then L m '  ← убранные строки: из цифр' '  ← removed lines: digits'
     elif [[ "${1##*/}" =~ _notutf8(_[0-9]+)?\.txt$ ]]; then L m '  ← убранные строки: не в UTF-8' '  ← removed lines: not UTF-8'
+    elif [[ "${1##*/}" =~ _prep(_[0-9]+)?\.txt$ ]]; then L m '  ← подготовка (пункт 2)' '  ← preparation (item 2)'
+    elif is_tool_out "$1"; then m="  ← ${REPLY}"
     fi
     printf '%s' "$m"
+}
+
+TOOL_OUT_SUFS=(uniq_nocase uniq_left bylen_desc logins passwords left right emails urls ip
+    userpass mac rest en ru lower upper cap uncap nospace firstword trim filtered kept removed
+    translit latin cyr greek hebrew arabic cjk other mixed top uniq edge noedge rtrim ltrim
+    minus common byfreq bylen shuffled)
+# Is the file an item 7 tool output (<source>_<suffix>.txt with the source next to it)? Mark in REPLY.
+is_tool_out() {
+    local b="${1##*/}" d="" s
+    [[ "$1" == */* ]] && d="${1%/*}/"
+    for s in "${TOOL_OUT_SUFS[@]}"; do
+        [[ "$b" =~ ^(.+)_${s}(_[0-9]+)?\.txt$ ]] || continue
+        [[ -f "${d}${BASH_REMATCH[1]}.txt" ]] || continue
+        case "$s" in
+            logins)    L REPLY "утилиты 7.1, 7.2: логины" "tools 7.1, 7.2: logins" ;;
+            passwords) L REPLY "утилита 7.2: пароли" "tool 7.2: passwords" ;;
+            left)      L REPLY "утилита 7.3: левые части" "tool 7.3: left parts" ;;
+            right)     L REPLY "утилита 7.3: правые части" "tool 7.3: right parts" ;;
+            emails)    L REPLY "утилита 7.4: почта" "tool 7.4: emails" ;;
+            urls)      L REPLY "утилита 7.4: ссылки" "tool 7.4: links" ;;
+            ip)        L REPLY "утилита 7.4: IP" "tool 7.4: IPs" ;;
+            userpass)  L REPLY "утилита 7.4: пары user:pass" "tool 7.4: user:pass pairs" ;;
+            mac)       L REPLY "утилита 7.4: MAC" "tool 7.4: MACs" ;;
+            rest)      L REPLY "утилиты 7.1–7.4: словарь без вырезанного" "tools 7.1–7.4: the dictionary without what was cut out" ;;
+            en|ru)     L REPLY "утилита 7.5: раскладка ${s^^}" "tool 7.5: ${s^^} layout" ;;
+            lower|upper|cap|uncap) L REPLY "утилита 7.6: регистр" "tool 7.6: case" ;;
+            nospace)   L REPLY "утилита 7.7: без строк с пробелом" "tool 7.7: no lines with a space" ;;
+            firstword) L REPLY "утилита 7.7: первое слово" "tool 7.7: first word" ;;
+            trim)      L REPLY "утилита 7.8: пробелы обрезаны" "tool 7.8: spaces trimmed" ;;
+            filtered)  L REPLY "утилита 7.9: строки убраны" "tool 7.9: lines removed" ;;
+            kept)      L REPLY "утилита 7.9: оставленные строки" "tool 7.9: kept lines" ;;
+            removed)   L REPLY "утилита 7.9: убранные строки" "tool 7.9: removed lines" ;;
+            translit)  L REPLY "утилита 7.10: транслит" "tool 7.10: transliteration" ;;
+            latin|cyr|greek|hebrew|arabic|cjk|other|mixed)
+                       _tl_alpha_what "$s"; L REPLY "утилита 7.11: ${REPLY}" "tool 7.11: ${REPLY}" ;;
+            top)       L REPLY "утилита 7.12: самые частые" "tool 7.12: the most frequent" ;;
+            uniq|uniq_nocase|uniq_left) L REPLY "утилита 7.13: без повторов" "tool 7.13: no duplicates" ;;
+            edge)      L REPLY "утилита 7.15: строки с пробелами по краям" "tool 7.15: lines with edge spaces" ;;
+            noedge)    L REPLY "утилита 7.15: без пробелов по краям" "tool 7.15: no edge spaces" ;;
+            rtrim)     L REPLY "утилита 7.15: обрезано справа" "tool 7.15: trimmed on the right" ;;
+            ltrim)     L REPLY "утилита 7.15: обрезано слева" "tool 7.15: trimmed on the left" ;;
+            minus)     L REPLY "утилита 7.16: без строк других словарей" "tool 7.16: without the lines of other dictionaries" ;;
+            common)    L REPLY "утилита 7.17: общие строки" "tool 7.17: common lines" ;;
+            byfreq)    L REPLY "утилита 7.18: по частоте" "tool 7.18: by frequency" ;;
+            bylen|bylen_desc) L REPLY "утилита 7.18: по длине" "tool 7.18: by length" ;;
+            shuffled)  L REPLY "утилита 7.19: случайный порядок" "tool 7.19: random order" ;;
+        esac
+        return 0
+    done
+    return 1
 }
 
 declare -a WORK_TXT=()
@@ -1812,7 +2130,8 @@ check_edge_blanks() {
         return 0
     fi
     (( total > 0 )) && L pct " ($(( n * 100 / total )),$(( n * 1000 / total % 10 ))% итога)" " ($(( n * 100 / total )).$(( n * 1000 / total % 10 ))% of the result)"
-    say "${YELLOW}⚠ Строк с пробелами или табами в начале или в конце: $(fmt_num "$n") из $(fmt_num "$total")${pct}, $(fmt_mb "$b") — убрать или обрезать: пункт 7, утилита 14${NC}" "${YELLOW}⚠ Lines with spaces or tabs at the start or end: $(fmt_num "$n") of $(fmt_num "$total")${pct}, $(fmt_mb "$b") — to remove or trim them: item 7, tool 14${NC}"
+    gap
+    say "${YELLOW}⚠ Строк с пробелами или табами в начале или в конце: $(fmt_num "$n") из $(fmt_num "$total")${pct}, $(fmt_mb "$b") — убрать или обрезать: пункт 7, утилита 15${NC}" "${YELLOW}⚠ Lines with spaces or tabs at the start or end: $(fmt_num "$n") of $(fmt_num "$total")${pct}, $(fmt_mb "$b") — to remove or trim them: item 7, tool 15${NC}"
     mapfile -t ex < <(edge_examples "$f" '^[[:blank:]]{1,2}[[:alnum:]]{4,}$' '^[[:alnum:]]{4,}[[:blank:]]{1,2}$')
     (( ${#ex[@]} > 0 )) || mapfile -t ex < <(edge_examples "$f" '^[[:blank:]]+[^[:blank:]]' '[^[:blank:]][[:blank:]]+$')
     for l in "${ex[@]}"; do
@@ -1858,6 +2177,7 @@ compare_warn() {
     rm -rf -- "$d"
     TMP_DIRS=()
     [[ -n "$parts" ]] || return 0
+    gap
     say "${YELLOW}⚠ В ${f} есть строки, которые пункт 3 не чистит, — они попадут в итог: ${parts#, }${NC}" "${YELLOW}⚠ ${f} has lines that item 3 does not clean — they will end up in the result: ${parts#, }${NC}"
     say "  Подготовить файл — пункт 1 (подготовка и сравнение) или пункт 2, а потом пункт 3." "  To prepare the file use item 1 (preparation and comparison), or item 2 and then item 3."
 }
@@ -1868,31 +2188,38 @@ declare -A RU_FREQ=([о]=110 [е]=85 [а]=80 [и]=74 [н]=67 [т]=63 [с]=55 [р
     [ж]=9 [ш]=7 [ю]=6 [ц]=5 [щ]=4 [э]=3 [ф]=3
     [О]=110 [Е]=85 [А]=80 [И]=74 [Н]=67 [Т]=63 [С]=55 [Р]=47 [В]=45 [Л]=44 [К]=35
     [М]=32 [Д]=30 [П]=28 [У]=26 [Я]=20 [Ы]=19 [Ь]=17 [Г]=17 [З]=17 [Б]=16 [Ч]=14 [Й]=12 [Х]=10
-    [Ж]=9 [Ш]=7 [Ю]=6 [Ц]=5 [Щ]=4 [Э]=3 [Ф]=3)
+    [Ж]=9 [Ш]=7 [Ю]=6 [Ц]=5 [Щ]=4 [Э]=3 [Ф]=3
+    [і]=74 [І]=74 [ї]=74 [ў]=45 [є]=85 [ґ]=17)
 D8_ENC=""; D8_BAD=0; D8_HI=0
 declare -a D8_EX=()
 
-D8_MIX_AWK='
-BEGIN {
-    for (i = 128; i < 256; i++) { ORD[sprintf("%c", i)] = i; M1[i] = -1; M2[i] = -1; M3[i] = -1 }
-    for (i = 0; i < 1089; i++) T[i] = substr(bi, i + 1, 1) + 0
-    for (i = 0; i < 32; i++) { M1[192 + i] = i; M1[224 + i] = i }
-    M1[168] = 32; M1[184] = 32
-    split("30 0 1 22 4 5 20 3 21 8 9 10 11 12 13 14 15 31 16 17 18 19 6 2 28 27 7 24 29 25 23 26", k, " ")
-    for (i = 0; i < 32; i++) { M2[192 + i] = k[i + 1]; M2[224 + i] = k[i + 1] }
-    M2[163] = 32; M2[179] = 32
-    for (i = 0; i < 32; i++) M3[128 + i] = i
-    for (i = 0; i < 16; i++) { M3[160 + i] = i; M3[224 + i] = 16 + i }
-    M3[240] = 32; M3[241] = 32
+# awk program: per-line encoding — sample counts (count) or conversion (fix).
+LE_AWK='
+function conv(s, e,    i, n, c, b, o) {
+    n = length(s); o = ""
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1); b = ORD[c]
+        o = o ((b >= 128) ? TB[(e - 1) * 128 + b - 127] : c)
+    }
+    return o
 }
-NR % step != 0 { next }
-{
-    s = $0; if (substr(s, length(s)) == "\r") s = substr(s, 1, length(s) - 1)
-    N++; n = length(s); hi = 0
-    for (i = 1; i <= n; i++) { b = ORD[substr(s, i, 1)]; B[i] = b; if (b >= 128) hi++ }
-    if (hi == 0) { other++; next }
-    if (hi * 3 <= n) { west++; next }
-    for (e = 1; e <= 3; e++) { ok[e] = 1; sc[e] = 0; pr[e] = 0; pv[e] = -1 }
+function cls(s,    i, n, b, hi, e, a, best, ba, sa, any, wok, l, r, same) {
+    n = length(s); hi = 0; same = 1
+    for (i = 1; i <= n; i++) { b = ORD[substr(s, i, 1)]; B[i] = b; if (b >= 128) hi++; if (b != B[1]) same = 0 }
+    if (hi == 0) return 0
+    if (same && n > 1) return 6
+    if (hi * 3 <= n) {
+        wok = 1
+        for (i = 1; i <= n; i++) {
+            b = B[i]
+            if (b < 128) continue
+            if (!WL[b]) { wok = 0; break }
+            l = (i > 1) ? B[i - 1] : 0; r = (i < n) ? B[i + 1] : 0
+            if (!(LAT[l] || WL[l] || LAT[r] || WL[r])) { wok = 0; break }
+        }
+        return wok ? 4 : 5
+    }
+    ok[1] = ok[2] = ok[3] = 1; sc[1] = sc[2] = sc[3] = 0; pr[1] = pr[2] = pr[3] = 0; pv[1] = pv[2] = pv[3] = -1
     for (i = 1; i <= n; i++) {
         b = B[i]
         if (b < 128) { pv[1] = pv[2] = pv[3] = -1; continue }
@@ -1911,57 +2238,228 @@ NR % step != 0 { next }
         a = sc[e] / pr[e]
         if (a > ba) { sa = ba; ba = a; best = e } else if (a > sa) sa = a
     }
-    if (!any) { other++; next }
-    if (best == 0) { unsure++; next }
-    if (ba < 4) { other++; next }
-    if (sa >= 0 && ba - sa < 0.5) { unsure++; next }
-    C[best]++
+    if (!any) return 6
+    if (best == 0) return 7
+    if (ba < 4) return 6
+    if (sa >= 0 && ba - sa < 0.5) return 7
+    return best
 }
-END { printf "%d %d %d %d %d %d %d\n", C[1], C[2], C[3], west, other, unsure, N }
+function letters(s, e,    i, n, b) {
+    n = length(s)
+    for (i = 1; i <= n; i++) {
+        b = ORD[substr(s, i, 1)]
+        if (e == 4 && LAT[b]) continue
+        if (b < 128) return 0
+        if (e == 1 && M1[b] < 0) return 0
+        if (e == 2 && M2[b] < 0) return 0
+        if (e == 3 && M3[b] < 0) return 0
+        if (e == 4 && !WL[b]) return 0
+    }
+    return 1
+}
+BEGIN {
+    for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+    for (i = 128; i < 256; i++) { M1[i] = -1; M2[i] = -1; M3[i] = -1 }
+    for (i = 0; i < 1089; i++) T[i] = substr(bi, i + 1, 1) + 0
+    for (i = 0; i < 32; i++) { M1[192 + i] = i; M1[224 + i] = i }
+    M1[168] = 32; M1[184] = 32
+    M1[179] = 8; M1[178] = 8; M1[191] = 8; M1[162] = 2; M1[186] = 5; M1[180] = 3
+    split("30 0 1 22 4 5 20 3 21 8 9 10 11 12 13 14 15 31 16 17 18 19 6 2 28 27 7 24 29 25 23 26", k, " ")
+    for (i = 0; i < 32; i++) { M2[192 + i] = k[i + 1]; M2[224 + i] = k[i + 1] }
+    M2[163] = 32; M2[179] = 32
+    for (i = 0; i < 32; i++) M3[128 + i] = i
+    for (i = 0; i < 16; i++) { M3[160 + i] = i; M3[224 + i] = 16 + i }
+    M3[240] = 32; M3[241] = 32
+    for (i = 65; i <= 90; i++) { LAT[i] = 1; LAT[i + 32] = 1 }
+    for (i = 192; i < 256; i++) WL[i] = 1
+    WL[215] = 0; WL[247] = 0
+    WL[138] = WL[140] = WL[142] = WL[154] = WL[156] = WL[158] = WL[159] = 1
+    if (tabs != "") split(tabs, TB, "|")
+    MK1 = sprintf("%c", 1); MK2 = sprintf("%c", 2)
+}
+mode == "count" {
+    if (NR % step != 0) next
+    s = $0; if (substr(s, length(s)) == "\r") s = substr(s, 1, length(s) - 1)
+    N++; e = cls(s); C[e]++
+    if (tabs != "" && e >= 1 && e <= 4 && !(e in EXW) && length(s) <= 40) {
+        if (length(s) >= 5 && letters(s, e)) EXW[e] = conv(s, e)
+        else if (!(e in EX)) EX[e] = conv(s, e)
+    }
+    next
+}
+{
+    c = substr($0, 1, 1)
+    if (c == MK2) { print substr($0, 2); next }
+    if (c != MK1) { print; next }
+    s = substr($0, 2); cr = ""
+    if (substr(s, length(s)) == "\r") { s = substr(s, 1, length(s) - 1); cr = "\r" }
+    e = cls(s)
+    if (e >= 1 && e <= 4) { C[e]++; print conv(s, e) cr } else print s cr
+}
+END {
+    if (mode == "count") {
+        printf "%d %d %d %d %d %d %d %d\n", C[1], C[2], C[3], C[4] + C[5], C[4], C[6] + C[0], C[7], N
+        for (e = 1; e <= 4; e++) if (e in EXW) print e "\t" EXW[e]; else if (e in EX) print e "\t" EX[e]
+    } else if (cnt != "") printf "%d %d %d %d\n", C[1], C[2], C[3], C[4] > cnt
+}
 '
-# Lines not in UTF-8: what they look like (a sample over the whole file) — a message.
-bad_utf8_mix() {
-    local f="$1" bad="$2" step w k c west other unsure n s="" se="" p top=0 topn=""
+LE_TABS=""
+# Conversion tables for the per-line encoding (octal escapes for awk -v).
+lineenc_build() {
+    local e b hx s="" tok cur="" i t=""
+    local -a u=()
+    [[ -n "$LE_TABS" ]] && return 0
+    command -v iconv >/dev/null 2>&1 || return 1
+    for (( b = 0x80; b <= 0xff; b++ )); do printf -v hx '%02x' "$b"; s+="\\x${hx}\\n"; done
+    for e in WINDOWS-1251 KOI8-R CP866 WINDOWS-1252; do
+        u=(); i=0; cur=""
+        for tok in $(printf "$s" | iconv -f "$e" -t UTF-8 -c 2>/dev/null | od -An -to1 -v); do
+            if [[ "$tok" == 012 ]]; then u[i]="$cur"; cur=""; i=$((i + 1)); else cur+="\\${tok}"; fi
+        done
+        (( i == 128 )) || return 1
+        for (( i = 0; i < 128; i++ )); do t+="${u[i]:-\\357\\277\\275}|"; done
+    done
+    LE_TABS="$t"
+}
+# Pipeline step: convert each line not in UTF-8 from its own single-byte encoding.
+_st_lineenc() {
+    LC_ALL=C sed -b -E -e '/^[\x01\x02]/{' -e 's/^/\x02/' -e 'b' -e '}' -e "/${MIX_BAD}/s/^/\\x01/" \
+        | LC_ALL=C awk -v BINMODE=3 -v mode=fix -v bi="$KOI_BI" -v tabs="$LE_TABS" -v cnt="$P_LE" "$LE_AWK"
+}
+D8M_KEY="" D8M_W=0 D8M_K=0 D8M_C=0 D8M_WEST=0 D8M_WOK=0 D8M_OTHER=0 D8M_UNSURE=0 D8M_N=0 D8M_TXT=""
+declare -a D8M_EX=()
+# Classify a sample of the lines not in UTF-8 (WINDOWS-1251, KOI8-R, CP866, Western, other).
+d8_mix_counts() {
+    local f="$1" bad="$2" step l first=true
+    [[ "$D8M_KEY" == "${f}|${bad}" ]] && return 0
+    D8M_KEY="${f}|${bad}"; D8M_W=0 D8M_K=0 D8M_C=0 D8M_WEST=0 D8M_WOK=0 D8M_OTHER=0 D8M_UNSURE=0 D8M_N=0; D8M_EX=()
+    [[ -n "$UTF8_LOCALE" ]] || return 0
+    lineenc_build
+    if fc_get "d8m.$bad" "$f"; then
+        read -r D8M_W D8M_K D8M_C D8M_WEST D8M_WOK D8M_OTHER D8M_UNSURE D8M_N <<< "$REPLY"
+        [[ "$D8M_N" =~ ^[0-9]+$ ]] || D8M_N=0
+        if fc_get "d8mex.$bad" "$f"; then
+            for l in $REPLY; do [[ "$l" == - ]] && continue; hex2bytes "$l"; D8M_EX+=("$REPLY"); done
+        fi
+        return 0
+    fi
     step=$(( bad / 20000 + 1 ))
-    read -r w k c west other unsure n < <(LC_ALL="$UTF8_LOCALE" grep -a -v -x '.*' -- "$f" 2>/dev/null \
-        | LC_ALL=C awk -v BINMODE=3 -v step="$step" -v bi="$KOI_BI" "$D8_MIX_AWK")
-    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 30 )) || return 0
+    while IFS= read -r l; do
+        if $first; then
+            read -r D8M_W D8M_K D8M_C D8M_WEST D8M_WOK D8M_OTHER D8M_UNSURE D8M_N <<< "$l"
+            first=false
+        else
+            D8M_EX+=("$l")
+        fi
+    done < <(LC_ALL="$UTF8_LOCALE" grep -a -v -x '.*' -- "$f" 2>/dev/null | LC_ALL=C grep -a -v -E "$SHY8_RE" \
+             | LC_ALL=C awk -v BINMODE=3 -v mode=count -v step="$step" -v bi="$KOI_BI" -v tabs="$LE_TABS" "$LE_AWK")
+    [[ "$D8M_N" =~ ^[0-9]+$ ]] || D8M_N=0
+    fc_put "d8m.$bad" "$f" "$D8M_W $D8M_K $D8M_C $D8M_WEST $D8M_WOK $D8M_OTHER $D8M_UNSURE $D8M_N"
+    if [[ "$f" == "$FC_FILE" ]]; then
+        local hx=""
+        for l in "${D8M_EX[@]}"; do fc_hex "$l"; hx+=" $REPLY"; done
+        fc_put "d8mex.$bad" "$f" "${hx# }"
+        [[ -n "$hx" ]] || fc_put "d8mex.$bad" "$f" "-"
+    fi
+    return 0
+}
+# The sample shares as one line, in the interface language (D8M_TXT); "rest" — of what the
+# per-line conversion leaves.
+d8_mix_text() {
+    local s="" se="" p den=$D8M_N
     _mix_part() {
         (( $1 > 0 )) || return 0
-        p=$(( ($1 * 100 + n / 2) / n ))
+        p=$(( ($1 * 100 + den / 2) / den ))
         if (( p == 0 )); then p="< 1"; fi
         [[ -n "$s" ]] && { s+=", "; se+=", "; }
         s+="$2 — ${p} %"; se+="$3 — ${p}%"
     }
-    _mix_part "$c" CP866 CP866
-    _mix_part "$k" KOI8-R KOI8-R
-    _mix_part "$w" WINDOWS-1251 WINDOWS-1251
-    _mix_part "$west" "западные языки (мало старших байтов)" "Western languages (few high bytes)"
-    _mix_part "$other" "не похоже на русский" "not like Russian"
-    _mix_part "$unsure" "не отличить" "cannot tell"
+    if [[ "${1:-}" == rest ]]; then
+        den=$(( D8M_OTHER + D8M_UNSURE + D8M_WEST - D8M_WOK ))
+        (( den > 0 )) || { D8M_TXT=""; unset -f _mix_part; return 0; }
+        _mix_part "$D8M_OTHER" "не похоже на русский" "not like Russian"
+        _mix_part "$D8M_UNSURE" "кодировку не отличить" "the encoding cannot be told"
+        _mix_part $(( D8M_WEST - D8M_WOK )) "западные, но не из WINDOWS-1252 (знак не буква с диакритикой или стоит не рядом с латиницей)" "Western, but not WINDOWS-1252 (a sign that is not a letter with diacritics, or not next to Latin letters)"
+        unset -f _mix_part
+        L D8M_TXT "$s" "$se"
+        return 0
+    fi
+    _mix_part "$D8M_C" CP866 CP866
+    _mix_part "$D8M_K" KOI8-R KOI8-R
+    _mix_part "$D8M_W" WINDOWS-1251 WINDOWS-1251
+    _mix_part "$D8M_WEST" "западные языки (мало старших байтов)" "Western languages (few high bytes)"
+    _mix_part "$D8M_OTHER" "не похоже на русский" "not like Russian"
+    _mix_part "$D8M_UNSURE" "не отличить" "cannot tell"
     unset -f _mix_part
-    say "  Из чего они (выборка $(fmt_num "$n") строк по всему файлу): ${s}" "  What they are (a sample of $(fmt_num "$n") lines over the whole file): ${se}"
-    for p in "$w WINDOWS-1251" "$k KOI8-R" "$c CP866"; do
+    L D8M_TXT "$s" "$se"
+}
+# Lines not in UTF-8: what they look like (a sample over the whole file) — a message.
+bad_utf8_mix() {
+    local f="$1" bad="$2" p top=0 topn="" n
+    d8_mix_counts "$f" "$bad"
+    n=$D8M_N
+    (( n >= 30 )) || return 0
+    d8_mix_text
+    [[ "${3:-}" == short ]] || say "  Из чего они (выборка $(fmt_num "$n") строк по всему файлу): ${D8M_TXT}" "  What they are (a sample of $(fmt_num "$n") lines over the whole file): ${D8M_TXT}"
+    for p in "$D8M_W WINDOWS-1251" "$D8M_K KOI8-R" "$D8M_C CP866" "$D8M_WEST WINDOWS-1252"; do
         if (( ${p%% *} > top )); then top=${p%% *}; topn="${p#* }"; fi
     done
     if (( top * 10 >= n * 8 )); then
-        say "  Больше всего похожи на ${topn}: её можно указать на вопросе о кодировке" "  Most of them look like ${topn}: you can type it at the encoding question"
+        enc_hint="$topn"
+        say "${CYAN}  Больше всего похожи на ${topn}: она подставится по Enter на вопросе о кодировке${AN_AT_R}${NC}" "${CYAN}  Most of them look like ${topn}: it is used if you press Enter at the encoding question${AN_AT_E}${NC}"
     else
-        say "  Это смесь: одну кодировку для всех не подставить, а Enter на вопросе о кодировке их уберёт." "  It is a mix: one encoding does not fit them all, and Enter at the encoding question removes them."
-        say "  Их можно сохранить отдельным файлом (вопрос ниже): итогу это не мешает, разобрать их можно потом" "  You can save them to a separate file (a later question): the result is not affected, and they can be sorted out later"
+        say "  Это смесь: одну кодировку для всех не подставить, а Enter на вопросе о кодировке${AN_AT_R} их уберёт." "  It is a mix: one encoding does not fit them all, and Enter at the encoding question${AN_AT_E} removes them."
+        say "  Их можно сохранить отдельным файлом (${AN_Q_R}): итогу это не мешает, разобрать их можно потом" "  You can save them to a separate file (${AN_Q_E}): the result is not affected, and they can be sorted out later"
+    fi
+}
+# Several single-byte encodings in one file: offer to convert each line from its own.
+lineenc_ask() {
+    local q def=n cyr l e t
+    local -a nm=("" WINDOWS-1251 KOI8-R CP866 WINDOWS-1252)
+    d8_mix_counts "$input" "$D8_BAD"
+    (( D8M_N >= 30 )) || return 0
+    cyr=$(( D8M_W + D8M_K + D8M_C ))
+    (( cyr * 10 >= D8M_N )) || return 0
+    le_offered=true
+    d8_mix_text
+    gap
+    say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$D8_BAD") — одной кодировки на весь файл не подобрать: по выборке ($(fmt_num "$D8M_N") строк по всему файлу) ${D8M_TXT}${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$D8_BAD") — no single encoding fits the whole file: by a sample ($(fmt_num "$D8M_N") lines over the whole file) ${D8M_TXT}${NC}"
+    say "  Каждую строку можно перевести из её кодировки: какой — решают сочетания русских букв (в WINDOWS-1251 — ещё белорусские и украинские і ў ї є ґ); западную — из WINDOWS-1252, если её буквы с диакритикой стоят рядом с латиницей." "  Each line can be converted from its own encoding: Russian letter pairs decide which (in WINDOWS-1251 also the Belarusian and Ukrainian і ў ї є ґ); a Western line from WINDOWS-1252 if its letters with diacritics stand next to Latin ones."
+    say "  Остальные (не похоже на русский, не отличить) останутся как есть — их уберёт проверка UTF-8, сохранить их можно отдельным файлом." "  The rest (not like Russian, cannot tell) stay as they are — the UTF-8 check removes them, and you can save them to a separate file."
+    if (( ${#D8M_EX[@]} > 0 )); then
+        say "  Например, после перевода:" "  For example, after conversion:"
+        for l in "${D8M_EX[@]}"; do
+            e="${l%%$'\t'*}"; t="${l#*$'\t'}"
+            [[ "$e" =~ ^[1-4]$ ]] || continue
+            t="$(printf '%s\n' "$t" | ctrl_visible)"
+            say "   ${nm[e]}: «${t//\\/\\\\}»"
+        done
+    fi
+    (( cyr * 2 >= D8M_N )) && def=y
+    L q "Перевести каждую строку из её кодировки?" "Convert each line from its own encoding?"
+    if confirm_action "$q" "$def"; then
+        if lineenc_build; then
+            do_lineenc=true
+        else
+            say "${YELLOW}⚠ Не удалось собрать таблицы перевода — строки не в UTF-8 останутся${NC}" "${YELLOW}⚠ Could not build the conversion tables — the non-UTF-8 lines stay${NC}"
+        fi
     fi
 }
 # Lines not in UTF-8: guess WINDOWS-1251, KOI8-R or CP866 by Russian letter frequencies.
-detect_8bit() {
+_detect_8bit() {
     local f="$1" e s n_all w cnt ch best="" bs=0 second=0 sample
     D8_ENC=""; D8_BAD=0; D8_HI=0; D8_EX=()
     [[ -n "$UTF8_LOCALE" ]] && command -v iconv >/dev/null 2>&1 || return 0
-    D8_BAD="$(LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "$f" 2>/dev/null)"
+    if pq_take d8bad "$f"; then D8_BAD=$REPLY; else
+        D8_BAD="$(LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "$f" 2>/dev/null)"
+    fi
     [[ "$D8_BAD" =~ ^[0-9]+$ ]] || D8_BAD=0
     (( D8_BAD > 0 )) || return 0
-    D8_HI="$(LC_ALL=C grep -a -c $'[\x80-\xff]' -- "$f" 2>/dev/null)"
+    if pq_take d8hi "$f"; then D8_HI=$REPLY; else
+        D8_HI="$(LC_ALL=C grep -a -c $'[\x80-\xff]' -- "$f" 2>/dev/null)"
+    fi
     [[ "$D8_HI" =~ ^[0-9]+$ ]] || D8_HI=0
-    sample="$(LC_ALL="$UTF8_LOCALE" grep -a -v -x '.*' -- "$f" | head -c 262144)"
+    sample="$(LC_ALL="$UTF8_LOCALE" grep -a -v -x '.*' -- "$f" | LC_ALL=C grep -a -v -E "$SHY8_RE" | head -c 262144)"
     for e in WINDOWS-1251 KOI8-R CP866; do
         n_all=0; w=0
         while read -r cnt ch; do
@@ -1984,7 +2482,7 @@ S7_ALL=0; S7_KEEP=0; S7_LAT=0
 declare -a S7_WLO=(80 16 45 17 30 85 9 17 74 12 35 44 32 67 110 28)
 declare -a S7_WHI=(47 55 63 26 3 10 5 14 7 4 0 19 17 3 6 20)
 # Does the ASCII part of the file look like Russian CP866 text without the high bit?
-detect_7bit() {
+_detect_7bit() {
     local f="$1" cnt hx b n=0 lo=0 w=0 lat asc
     S7_ALL=0; S7_KEEP=0; S7_LAT=0
     while read -r cnt hx; do
@@ -2014,6 +2512,9 @@ detect_7bit() {
 }
 
 MIX_BAD=$'[\xc0-\xff][\x01-\x7f\xc0-\xff]|[\x01-\x7f][\x80-\xbf]|^[\x80-\xbf]|[\xc0-\xff]\r?$'
+MIX_BAD+=$'|[\xc0-\xdf][\x80-\xbf]{2}|[\xe0-\xef][\x80-\xbf]{3}|[\xf0-\xff][\x80-\xbf]{4}'
+MIX_BAD+=$'|[\xe0-\xff][\x80-\xbf]([\x01-\x7f\xc0-\xff]|$)|[\xf0-\xff][\x80-\xbf]{2}([\x01-\x7f\xc0-\xff]|$)'
+MIX_BAD+=$'|[\xc0\xc1\xf5-\xff]|\xe0[\x80-\x9f]|\xed[\xa0-\xbf]|\xf0[\x80-\x8f]|\xf4[\x90-\xbf]'
 declare -a MIX_SED=()
 # sed program that converts only the non-UTF-8 lines of a mixed file (MIX_SED).
 mix_sed_build() {
@@ -2035,11 +2536,11 @@ mix_sed_build() {
 }
 _st_mix() { LC_ALL=C sed -b -E "${MIX_SED[@]}"; }
 
-ENC_HOLES=""
+ENC_HOLES="" ENC_8BIT=false
 enc_holes() {
     local enc="$1" b hx s="" tok cur="" i=0 n=0
     local -a u=()
-    ENC_HOLES=""
+    ENC_HOLES=""; ENC_8BIT=false
     case "${enc^^}" in UTF*|UCS*) return 0 ;; esac
     for (( b = 0x80; b <= 0xff; b++ )); do printf -v hx '%02x' "$b"; s+="\\x${hx}\\n"; done
     for tok in $(printf "$s" | iconv -f "$enc" -t UTF-8 -c 2>/dev/null | od -An -tx1 -v); do
@@ -2048,6 +2549,7 @@ enc_holes() {
     (( i == 128 )) || return 0
     for (( b = 0; b < 128; b++ )); do [[ -z "${u[b]}" ]] && n=$((n + 1)); done
     (( n <= 32 )) || return 0
+    ENC_8BIT=true
     for (( b = 0x80; b <= 0x9f; b++ )); do
         [[ -z "${u[b - 0x80]}" ]] || continue
         printf -v hx '%02x' "$b"
@@ -2080,6 +2582,20 @@ hole_class() {
     printf -v REPLY '%b' "[${s}]"
 }
 
+# A typed single-byte encoding on a file that is mostly UTF-8: convert only the lines
+# not in UTF-8 (as for a mixed file), so the UTF-8 lines are not spoiled.
+enc_only_bad() {
+    local src="$1" vhi=$(( D8_HI - D8_BAD ))
+    (( D8_BAD > 0 && vhi > 0 && vhi * 100 >= D8_HI )) || return 1
+    enc_holes "$src"
+    $ENC_8BIT || return 1
+    mix_sed_build "$src" || return 1
+    do_mix=true; mix_all=$D8_BAD; mix_enc="$src"; bad_utf8=0
+    say "${YELLOW}⚠ Строк с не-ASCII в верном UTF-8: $(fmt_num "$vhi") — перевод всего файла из ${src} их испортил бы.${NC}" "${YELLOW}⚠ Lines with non-ASCII in valid UTF-8: $(fmt_num "$vhi") — converting the whole file from ${src} would spoil them.${NC}"
+    say "  Из ${src} переведу только строки не в UTF-8: $(fmt_num "$D8_BAD")" "  Only the lines not in UTF-8 are converted from ${src}: $(fmt_num "$D8_BAD")"
+    hole_ask "$src" mix
+    return 0
+}
 # Bytes the encoding has no character for (98 in WINDOWS-1251): count and ask.
 hole_ask() {
     local enc="$1" kind="$2" cls n list cp q
@@ -2095,18 +2611,13 @@ hole_ask() {
     (( n > 0 )) || return 0
     hole_set="$ENC_HOLES"; hole_all=$n
     list="${ENC_HOLES^^}"; list="${list// /, }"
-    local was
-    if [[ "$kind" == mix ]]; then
-        L was "раньше такая строка уходила как нечитаемая" "before, such a line was removed as unreadable"
-    else
-        L was "раньше iconv молча вырезал такой байт из строки" "before, iconv silently cut such a byte out of the line"
-    fi
+    gap
     if [[ "$ENC_HOLES" == *" "* ]]; then
         cp="U+0080–U+009F"
-        say "${YELLOW}⚠ Строк с байтами, которых нет в ${enc} (${list}): $(fmt_num "$n") — ${was}${NC}" "${YELLOW}⚠ Lines with bytes that ${enc} has no character for (${list}): $(fmt_num "$n") — ${was}${NC}"
+        say "${YELLOW}⚠ Строк с байтами ${list}: $(fmt_num "$n") — в ${enc} этим байтам не соответствует ни одна буква${NC}" "${YELLOW}⚠ Lines with the bytes ${list}: $(fmt_num "$n") — ${enc} has no letter for these bytes${NC}"
     else
         cp="U+00${list}"
-        say "${YELLOW}⚠ Строк с байтом ${list}, которого нет в ${enc}: $(fmt_num "$n") — ${was}${NC}" "${YELLOW}⚠ Lines with the byte ${list}, which ${enc} has no character for: $(fmt_num "$n") — ${was}${NC}"
+        say "${YELLOW}⚠ Строк с байтом ${list}: $(fmt_num "$n") — в ${enc} этому байту не соответствует ни одна буква${NC}" "${YELLOW}⚠ Lines with the byte ${list}: $(fmt_num "$n") — ${enc} has no letter for this byte${NC}"
     fi
     [[ " $ENC_HOLES " == *" 98 "* ]] && say "  Байт 98 — это буква Ш в DOS-тексте (CP866) и вторая половина буквы И в UTF-8: такие строки — кракозябры, без него слово стало бы неверным." "  Byte 98 is the letter Ш in DOS text (CP866) and the second half of И in UTF-8: such lines are mojibake, and without it the word would be wrong."
     say "  Да — оставить на его месте невидимый знак ${cp}: пункт 2 на результате с ответом «да» на «Восстановить кракозябры» вернёт букву, а что не восстановится — уберёт." "  Yes — put the invisible character ${cp} in its place: item 2 on the result with «yes» to «Restore the mojibake» brings the letter back and removes what it cannot restore."
@@ -2117,13 +2628,216 @@ hole_ask() {
 }
 
 # All preparation questions; the answers go to the local variables of prep_file.
+PQ_DIR=""; PQ_FILE=""
+declare -A PQ_PID=()
+PQ_KEYS="feff nul d8bad d8hi moji dos u8 cesu crmid ctrl blank lines shy westw westm shy8"
+# One full-file count of the preparation questions (run in the background by pq_start).
+_pq_count() {
+    local f="$2"
+    case "$1" in
+        feff)  if has_bom "$f"; then tail -c +4 -- "$f" | LC_ALL=C grep -a -c "$BOM_CHR"; else LC_ALL=C grep -a -c "$BOM_CHR" -- "$f"; fi ;;
+        nul)   LC_ALL=C grep -a -c -P '\x00' -- "$f" ;;
+        d8bad) LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "$f" ;;
+        d8hi)  LC_ALL=C grep -a -c $'[\x80-\xff]' -- "$f" ;;
+        moji)  LC_ALL=C grep -a -E "$MOJI_LEAD" -- "$f" | LC_ALL=C grep -a -c -E "$MOJI_RE" ;;
+        dos)   LC_ALL=C grep -a -E "$DOS_SYM" -- "$f" | _st_dos_sel | LC_ALL=C grep -a -c '' ;;
+        u8)    LC_ALL=C grep -a -E "$U8X_START" -- "$f" | _st_u8_sel | LC_ALL=C grep -a -c '' ;;
+        cesu)  LC_ALL=C grep -a -E "$CESU_SEQ" -- "$f" | LC_ALL=C grep -a -c -E "$CESU_LINE" ;;
+        crmid) LC_ALL=C grep -a -U -c "${CR_CHR}." -- "$f" ;;
+        ctrl)  LC_ALL=C grep -a -c -e "$CTRL_RE" -e "$C1_RE" -- "$f" ;;
+        blank) LC_ALL=C grep -a -U -c -P "$BLANK_RE" -- "$f" ;;
+        lines) wc -l < "$f" ;;
+        shy)   LC_ALL=C grep -a -c -E $'\xc2\xad' -- "$f" ;;
+        shy8)  _shy8_sel < "$f" | LC_ALL=C grep -a -c '' ;;
+        westw) LC_ALL=C grep -a -E "$WEST_L" -- "$f" | _st_west_sel1 | LC_ALL=C grep -a -c '' ;;
+        westm) LC_ALL=C grep -a -E $'[\xd0\xd1][\x80-\xbf]' -- "$f" | LC_ALL=C grep -a -c '[A-Za-z]' ;;
+    esac
+}
+# Start all independent full-file counts at once, each in its own background process.
+pq_start() {
+    local f="$1" k min="${DEDUP_PQ_MIN:-8388608}"
+    PQ_DIR=""; PQ_FILE=""; PQ_PID=()
+    [[ "$min" =~ ^[0-9]+$ ]] || min=8388608
+    (( $(file_size "$f") >= min )) || return 0
+    [[ "$FC_FILE" == "$f" && -n "${FC[pq.lines]+x}" ]] && return 0
+    PQ_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dedup_tool.XXXXXX" 2>/dev/null)" || { PQ_DIR=""; return 0; }
+    TMP_DIRS+=("$PQ_DIR")
+    PQ_FILE="$f"
+    for k in $PQ_KEYS; do
+        [[ "$k" == d8bad && -z "$UTF8_LOCALE" ]] && continue
+        _pq_count "$k" "$f" > "$PQ_DIR/$k" 2>/dev/null &
+        PQ_PID[$k]=$!
+        COUNTER_PIDS+=($!)
+    done
+}
+# Take a background count (waits for it); code 1 — there is none, count as before.
+pq_take() {
+    REPLY=""
+    if fc_get "pq.$1" "$2" && [[ "$REPLY" =~ ^[0-9]+$ ]]; then return 0; fi
+    REPLY=""
+    [[ -n "$PQ_DIR" && "$2" == "$PQ_FILE" && -n "${PQ_PID[$1]:-}" ]] || return 1
+    wait "${PQ_PID[$1]}" 2>/dev/null
+    read -r REPLY < "$PQ_DIR/$1" 2>/dev/null
+    REPLY="${REPLY//[[:space:]]/}"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || { REPLY=""; return 1; }
+}
+# Wait for the counts that nobody took and remove their folder.
+pq_stop() {
+    [[ -n "$PQ_DIR" ]] || return 0
+    local p d k v
+    local -a keep=()
+    wait "${PQ_PID[@]}" 2>/dev/null
+    for k in "${!PQ_PID[@]}"; do
+        read -r v < "$PQ_DIR/$k" 2>/dev/null
+        v="${v//[[:space:]]/}"
+        [[ "$v" =~ ^[0-9]+$ ]] && fc_put "pq.$k" "$PQ_FILE" "$v"
+    done
+    rm -rf -- "$PQ_DIR"
+    for d in "${TMP_DIRS[@]}"; do [[ "$d" == "$PQ_DIR" ]] || keep+=("$d"); done
+    TMP_DIRS=("${keep[@]}")
+    keep=()
+    for p in "${COUNTER_PIDS[@]}"; do
+        [[ " ${PQ_PID[*]} " == *" $p "* ]] || keep+=("$p")
+    done
+    COUNTER_PIDS=("${keep[@]}")
+    PQ_DIR=""; PQ_FILE=""; PQ_PID=()
+}
+
+declare -A FC=() WSL_SRC=()
+FC_FILE="" FC_PATH="" FC_SIZE="" FC_MTIME="" FC_TIME="" FC_HIT=false FC_NEW=false FC_MAX=300
+# Absolute path of a file for the results cache (the original one in the WSL temp folder).
+fc_src() {
+    local f="$1"
+    if [[ -n "$WSL_TEMP_DIR" && "$f" != */* && -n "${WSL_SRC[$f]:-}" ]]; then REPLY="${WSL_SRC[$f]}"
+    elif [[ "$f" == /* ]]; then REPLY="$f"
+    else REPLY="$(pwd)/${f#./}"; fi
+}
+# Load the saved results of the checks of a file, if it has not changed since (FC, FC_HIT).
+fc_load() {
+    local f="$1" cf line t min="${DEDUP_PQ_MIN:-8388608}" i s m
+    local -a a=()
+    read -r s m < <(stat -L -c '%s %Y' -- "$f" 2>/dev/null)
+    [[ "$FC_FILE" == "$f" && "$s" == "$FC_SIZE" && "$m" == "$FC_MTIME" ]] && return 0
+    FC=(); FC_FILE=""; FC_HIT=false; FC_NEW=false; FC_PATH=""; FC_TIME=""
+    [[ -n "$LOG_FILE" && "$s" =~ ^[0-9]+$ && "$m" =~ ^[0-9]+$ ]] || return 0
+    [[ "$min" =~ ^[0-9]+$ ]] || min=8388608
+    (( s >= min )) || return 0
+    fc_src "$f"; FC_PATH="$REPLY"
+    FC_FILE="$f"; FC_SIZE="$s"; FC_MTIME="$m"
+    $FC_RECHECK && return 0
+    cf="${LOG_FILE%/*}/.dedup_cache"
+    [[ -f "$cf" ]] || return 0
+    while IFS= read -r line; do
+        [[ "${line%%$'\t'*}" == "$FC_PATH" ]] || continue
+        IFS=$'\t' read -r -a a <<< "$line"
+        [[ "${a[1]}" == "$FC_SIZE" && "${a[2]}" == "$FC_MTIME" && "${a[3]}" == "$VERSION" && "${a[4]}" =~ ^[0-9]+$ ]] || continue
+        FC=(); FC_TIME="${a[4]}"
+        for (( i = 5; i < ${#a[@]}; i++ )); do [[ "${a[i]}" == *=* ]] && FC["${a[i]%%=*}"]="${a[i]#*=}"; done
+        FC_HIT=true
+    done < "$cf"
+    if $FC_HIT; then
+        if [[ "$UI_LANG" == en ]]; then printf -v t '%(%d.%m at %H:%M)T' "$FC_TIME"; else printf -v t '%(%d.%m в %H:%M)T' "$FC_TIME"; fi
+        say "${BLUE}Проверено ${t} — файл с тех пор не менялся, беру прежние числа (пересчитать — запуск с ключом --recheck)${NC}" "${BLUE}Checked ${t} — the file has not changed since, the earlier numbers are used (to recount, run with --recheck)${NC}"
+    fi
+    return 0
+}
+# Get a saved value of the current file into REPLY (code 1 — none).
+fc_get() { [[ -n "$FC_FILE" && "$2" == "$FC_FILE" && -n "${FC[$1]+x}" ]] || return 1; REPLY="${FC[$1]}"; }
+# Remember a value of the current file for the results cache.
+fc_put() {
+    [[ -n "$FC_FILE" && "$2" == "$FC_FILE" ]] || return 0
+    [[ "$3" == *[$'\t\n']* ]] && return 0
+    [[ -n "${FC[$1]+x}" && "${FC[$1]}" == "$3" ]] && return 0
+    FC[$1]="$3"; FC_NEW=true
+}
+# Write the results of the current file to logs/.dedup_cache (replacing its old line).
+fc_save() {
+    [[ -n "$FC_FILE" && -n "$LOG_FILE" ]] && $FC_NEW || return 0
+    local cf="${LOG_FILE%/*}/.dedup_cache" tmp k line l now
+    printf -v now '%(%s)T' -1
+    [[ -n "$FC_TIME" ]] || FC_TIME=$now
+    line="${FC_PATH}"$'\t'"${FC_SIZE}"$'\t'"${FC_MTIME}"$'\t'"${VERSION}"$'\t'"${FC_TIME}"
+    for k in "${!FC[@]}"; do line+=$'\t'"${k}=${FC[$k]}"; done
+    tmp="${cf}.$$"
+    {
+        if [[ -f "$cf" ]]; then
+            while IFS= read -r l; do
+                [[ "${l%%$'\t'*}" == "$FC_PATH" ]] || printf '%s\n' "$l"
+            done < "$cf" | tail -n $(( FC_MAX - 1 ))
+        fi
+        printf '%s\n' "$line"
+    } > "$tmp" 2>/dev/null && mv -f -- "$tmp" "$cf" 2>/dev/null
+    rm -f -- "$tmp" 2>/dev/null
+    FC_NEW=false
+    return 0
+}
+# Hex of a string into REPLY (for examples in the results cache).
+fc_hex() { REPLY="$(printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n')"; }
+# detect_7bit with the results cache.
+detect_7bit() {
+    if fc_get s7 "$1"; then read -r S7_ALL S7_KEEP S7_LAT <<< "$REPLY"; return 0; fi
+    _detect_7bit "$1"
+    fc_put s7 "$1" "$S7_ALL $S7_KEEP $S7_LAT"
+    return 0
+}
+# detect_koi with the results cache.
+detect_koi() {
+    if fc_get koi "$1"; then read -r KOI_ALL KOI_REST <<< "$REPLY"; return 0; fi
+    _detect_koi "$1"
+    fc_put koi "$1" "$KOI_ALL $KOI_REST"
+    return 0
+}
+# detect_west with the results cache.
+detect_west() {
+    if fc_get west "$1"; then WEST_ALL="$REPLY"; return 0; fi
+    _detect_west "$1"
+    fc_put west "$1" "$WEST_ALL"
+    return 0
+}
+# detect_8bit with the results cache.
+detect_8bit() {
+    local e b h x hx=""
+    local -a xs=()
+    if fc_get d8 "$1"; then
+        read -r e b h x <<< "$REPLY"
+        D8_ENC="${e#-}"; D8_BAD="$b"; D8_HI="$h"; D8_EX=()
+        IFS=, read -r -a xs <<< "$x"
+        for x in "${xs[@]}"; do [[ "$x" == - || -z "$x" ]] && continue; hex2bytes "$x"; D8_EX+=("$REPLY"); done
+        return 0
+    fi
+    _detect_8bit "$1"
+    if [[ "$1" == "$FC_FILE" ]]; then
+        for x in "${D8_EX[@]}"; do fc_hex "$x"; hx+="${hx:+,}$REPLY"; done
+        fc_put d8 "$1" "${D8_ENC:--} ${D8_BAD:-0} ${D8_HI:-0} ${hx:--}"
+    fi
+    return 0
+}
+
+# The preparation questions: background counts around the questions themselves.
 prep_questions() {
+    local rc=0
+    fc_load "$input"
+    [[ -z "$(detect_utf16 "$input")" ]] && pq_start "$input"
+    _prep_questions_body || rc=$?
+    pq_stop
+    fc_save
+    return $rc
+}
+_prep_questions_body() {
     local q t
-    say "\n${GREEN}=== Подготовка: вопросы ===${NC}" "\n${GREEN}=== Preparation: questions ===${NC}"
-    say "Ответы запоминаются; файл пройдёт через выбранные шаги одним проходом после всех вопросов." "Answers are only remembered; after all questions the file goes through the chosen steps in one pass."
+    CONFIRM_AUTO=false
+    { $PREP_ANALYZE || $PREP_AUTO; } && CONFIRM_AUTO=true
+    if $PREP_ANALYZE; then
+        say "\n${GREEN}=== Что найдёт подготовка (пункт 2) ===${NC}" "\n${GREEN}=== What preparation (item 2) finds ===${NC}"
+    else
+        say "\n${GREEN}=== Подготовка: вопросы ===${NC}" "\n${GREEN}=== Preparation: questions ===${NC}"
+        say "Ответы запоминаются; файл пройдёт через выбранные шаги одним проходом после всех вопросов." "Answers are only remembered; after all questions the file goes through the chosen steps in one pass."
+        $PREP_AUTO && say "${BLUE}Вопросы, которые разобрал анализ, отвечаются как в нём; длину, цифры и сохранение убранных строк спрошу.${NC}" "${BLUE}Questions the analysis covered are answered as in it; length, digits and saving the removed lines are asked.${NC}"
+    fi
 
     enc16="$(detect_utf16 "$input")"
     if [[ -n "$enc16" ]]; then
+        gap
         say "${YELLOW}⚠ Файл похож на ${enc16} (BOM или нулевые байты 00H) — то же, на что ругаются EmEditor, Notepad++ и т.п.${NC}" "${YELLOW}⚠ The file looks like ${enc16} (BOM or 00H null bytes) — what EmEditor, Notepad++ and others complain about${NC}"
         if ! command -v iconv >/dev/null 2>&1; then
             say "${RED}⚠ iconv не найден — сконвертировать UTF-16 нечем, результат будет мусорным${NC}" "${RED}⚠ iconv not found — UTF-16 cannot be converted, the result will be garbage${NC}" >&2
@@ -2145,7 +2859,9 @@ prep_questions() {
     fi
 
     if [[ -z "$enc16" ]]; then
-        if has_bom "$input"; then
+        if pq_take feff "$input"; then
+            feff_mid=$REPLY
+        elif has_bom "$input"; then
             feff_mid="$(tail -c +4 -- "$input" | LC_ALL=C grep -a -c "$BOM_CHR")"
         else
             feff_mid="$(LC_ALL=C grep -a -c "$BOM_CHR" -- "$input" 2>/dev/null)"
@@ -2155,6 +2871,7 @@ prep_questions() {
     if [[ -n "$enc" ]]; then
         say "${BLUE}✓ CRLF и BOM уберутся вместе с конвертацией${NC}" "${BLUE}✓ CRLF and BOM will be removed with the conversion${NC}"
     elif { has_crlf "$input" && ! $s7_cr_letter; } || has_bom "$input" || (( feff_mid > 0 )); then
+        gap
         (( feff_mid > 0 )) && say "${YELLOW}⚠ Строк с невидимым U+FEFF (BOM) внутри файла: $(fmt_num "$feff_mid") — с ним слово не совпадёт с тем же словом в эталоне${NC}" "${YELLOW}⚠ Lines with an invisible U+FEFF (BOM) inside the file: $(fmt_num "$feff_mid") — such a word will not match the same word in a reference${NC}"
         L q "Найдены CRLF и/или BOM. Убрать?" "CRLF and/or BOM found. Remove them?"
         if confirm_action "$q" y; then
@@ -2167,17 +2884,26 @@ prep_questions() {
     fi
 
     if [[ -z "$enc16" ]]; then
-        nul_all="$(LC_ALL=C grep -a -c -P '\x00' -- "$input" 2>/dev/null)"
+        if pq_take nul "$input"; then nul_all=$REPLY; else
+            nul_all="$(LC_ALL=C grep -a -c -P '\x00' -- "$input" 2>/dev/null)"
+        fi
         [[ "$nul_all" =~ ^[0-9]+$ ]] || nul_all=0
         if (( s7_all > 0 && nul_all > 0 )); then
-            s7_nul="$(LC_ALL=C grep -a -P '\x00' -- "$input" | LC_ALL=C grep -a -U -c -P "$S7_LINE_RE")"
+            if fc_get s7nul "$input"; then s7_nul=$REPLY; else
+                s7_nul="$(LC_ALL=C grep -a -P '\x00' -- "$input" | LC_ALL=C grep -a -U -c -P "$S7_LINE_RE")"
+                fc_put s7nul "$input" "$s7_nul"
+            fi
             [[ "$s7_nul" =~ ^[0-9]+$ ]] || s7_nul=0
             nul_all=$(( nul_all - s7_nul ))
         fi
     fi
     if (( nul_all > 0 )); then
-        nul_word="$(LC_ALL=C grep -a -c -P "$NUL_WORD_RE" -- "$input" 2>/dev/null)"
+        if fc_get nulword "$input"; then nul_word=$REPLY; else
+            nul_word="$(LC_ALL=C grep -a -c -P "$NUL_WORD_RE" -- "$input" 2>/dev/null)"
+            fc_put nulword "$input" "$nul_word"
+        fi
         [[ "$nul_word" =~ ^[0-9]+$ ]] || nul_word=0
+        gap
         say "${YELLOW}⚠ Строк с байтами NUL (00H): $(fmt_num "$nul_all") — из-за них EmEditor и другие редакторы считают файл двоичным${NC}" "${YELLOW}⚠ Lines with NUL bytes (00H): $(fmt_num "$nul_all") — because of them EmEditor and other editors treat the file as binary${NC}"
         if (( nul_word > 0 )); then
             mapfile -t nul_ex < <(LC_ALL=C grep -a -m 3 -P '^\x00?(?:[\x20-\x7e]\x00){1,20}\r?$|^(?:\x00[\x20-\x7e]){1,20}\r?$' -- "$input" \
@@ -2197,11 +2923,42 @@ prep_questions() {
         (( nul_all > nul_word )) && say "  Не похожи на слова: $(fmt_num $(( nul_all - nul_word )))" "  Not like words: $(fmt_num $(( nul_all - nul_word )))"
         nul_left=$nul_all
         $do_nul && nul_left=$(( nul_all - nul_word ))
-        (( nul_left > 0 )) && say "  Строк с NUL останется: $(fmt_num "$nul_left") — их уберёт проверка UTF-8 (следующий вопрос)" "  Lines with NUL left: $(fmt_num "$nul_left") — the UTF-8 check removes them (a later question)"
+        if (( nul_left > 0 )); then
+            if $PREP_ANALYZE; then say "  Строк с NUL останется: $(fmt_num "$nul_left") — их уберёт проверка UTF-8 в пункте 2" "  Lines with NUL left: $(fmt_num "$nul_left") — the UTF-8 check of item 2 removes them"
+            else say "  Строк с NUL останется: $(fmt_num "$nul_left") — их уберёт проверка UTF-8 (следующий вопрос)" "  Lines with NUL left: $(fmt_num "$nul_left") — the UTF-8 check removes them (a later question)"; fi
+        fi
+    fi
+
+    if [[ -z "$enc16" ]]; then
+        if pq_take shy8 "$input"; then shy8_all=$REPLY; else
+            shy8_all="$(_shy8_sel < "$input" | LC_ALL=C grep -a -c '')"
+        fi
+        [[ "$shy8_all" =~ ^[0-9]+$ ]] || shy8_all=0
+    fi
+    if (( shy8_all > 0 )); then
+        gap
+        say "${YELLOW}⚠ Строк не в UTF-8 только из-за мягкого переноса (байт AD) внутри латинского слова: $(fmt_num "$shy8_all") — перенос невидимый, а со знаком слово не совпадёт с тем, что набирают${NC}" "${YELLOW}⚠ Lines not in UTF-8 only because of a soft hyphen (the byte AD) inside a Latin word: $(fmt_num "$shy8_all") — the hyphen is invisible, and with it the word does not match what people type${NC}"
+        say "  Это знак из однобайтовой кодировки (Windows-1251, Windows-1252, Latin-1): после него строка — обычный ASCII." "  It is a character from a single-byte encoding (Windows-1251, Windows-1252, Latin-1): without it the line is plain ASCII."
+        local -a shy8_ex=()
+        mapfile -t shy8_ex < <(_shy8_sel < "$input" | LC_ALL=C grep -a -m 3 -E '^.{1,60}$' \
+                                 | LC_ALL=C sed -b -e 's/\r$//' -e $'s/\xad/\xe2\x80\xa7/g' | ctrl_visible)
+        (( ${#shy8_ex[@]} > 0 )) && say "  Например (‧ — где стоит перенос):" "  For example (‧ marks the hyphen):"
+        for l in "${shy8_ex[@]}"; do say "   «${l//\\/\\\\}»"; done
+        L q "Убрать мягкий перенос из таких строк?" "Remove the soft hyphen from such lines?"
+        if confirm_action "$q" y; then
+            do_shy8=true
+        else
+            say "  Они останутся не в UTF-8: проверку UTF-8 они не пройдут" "  They stay not in UTF-8: they will not pass the UTF-8 check"
+        fi
     fi
 
     if [[ -z "$enc16" ]]; then
         detect_8bit "$input"
+        if $do_shy8; then
+            D8_BAD=$(( D8_BAD > shy8_all ? D8_BAD - shy8_all : 0 ))
+            D8_HI=$(( D8_HI > shy8_all ? D8_HI - shy8_all : 0 ))
+            (( D8_BAD > 0 )) || D8_ENC=""
+        fi
         if [[ -n "$D8_ENC" ]]; then
             local vhi=$(( D8_HI - D8_BAD )) ename="" ex mixed=false
             (( vhi > 0 && vhi * 100 >= D8_HI )) && mixed=true
@@ -2211,8 +2968,10 @@ prep_questions() {
                 CP866)        L ename "Кириллица (DOS)" "Cyrillic (DOS)" ;;
             esac
             if $mixed; then
+                gap
                 say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$D8_BAD"), а ещё $(fmt_num "$vhi") строк с не-ASCII — в UTF-8. Похоже на ${D8_ENC} (в редакторе — «${ename}»)${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$D8_BAD"), and $(fmt_num "$vhi") more lines with non-ASCII are UTF-8. Looks like ${D8_ENC} (in an editor: “${ename}”)${NC}"
             else
+                gap
                 say "${YELLOW}⚠ Файл не в UTF-8: строк не в UTF-8 — $(fmt_num "$D8_BAD") из $(fmt_num "$D8_HI") с не-ASCII. Похоже на ${D8_ENC} (в редакторе — «${ename}»)${NC}" "${YELLOW}⚠ The file is not UTF-8: $(fmt_num "$D8_BAD") of $(fmt_num "$D8_HI") lines with non-ASCII are not UTF-8. Looks like ${D8_ENC} (in an editor: “${ename}”)${NC}"
             fi
             (( ${#D8_EX[@]} > 0 )) && say "  Например, после перевода:" "  For example, after conversion:"
@@ -2229,30 +2988,52 @@ prep_questions() {
                 fi
             else
                 enc8="$D8_ENC"
-                say "  ${D8_ENC} подставится по Enter на вопросе о кодировке" "  ${D8_ENC} will be used if you press Enter at the encoding question"
+                say "  ${D8_ENC} подставится по Enter на вопросе о кодировке${AN_AT_R}" "  ${D8_ENC} will be used if you press Enter at the encoding question${AN_AT_E}"
             fi
+        elif (( D8_BAD > 0 )); then
+            lineenc_ask
         fi
     fi
 
     if [[ -z "$enc16" ]]; then
-        moji_all="$(LC_ALL=C grep -a -E "$MOJI_LEAD" -- "$input" | LC_ALL=C grep -a -c -E "$MOJI_RE")"
+        if pq_take moji "$input"; then moji_all=$REPLY; else
+            moji_all="$(LC_ALL=C grep -a -E "$MOJI_LEAD" -- "$input" | LC_ALL=C grep -a -c -E "$MOJI_RE")"
+        fi
         [[ "$moji_all" =~ ^[0-9]+$ ]] || moji_all=0
-        dos_all="$(LC_ALL=C grep -a -E "$DOS_SYM" -- "$input" | _st_dos_sel | LC_ALL=C grep -a -c '')"
+        if pq_take dos "$input"; then dos_all=$REPLY; else
+            dos_all="$(LC_ALL=C grep -a -E "$DOS_SYM" -- "$input" | _st_dos_sel | LC_ALL=C grep -a -c '')"
+        fi
         [[ "$dos_all" =~ ^[0-9]+$ ]] || dos_all=0
-        u8_all="$(LC_ALL=C grep -a -E "$U8X_START" -- "$input" | _st_u8_sel | LC_ALL=C grep -a -c '')"
+        if pq_take u8 "$input"; then u8_all=$REPLY; else
+            u8_all="$(LC_ALL=C grep -a -E "$U8X_START" -- "$input" | _st_u8_sel | LC_ALL=C grep -a -c '')"
+        fi
         [[ "$u8_all" =~ ^[0-9]+$ ]] || u8_all=0
         if (( u8_all > 0 )); then
-            u8t_all="$(LC_ALL=C grep -a -E $'\xd0[\xa0\xa1]\r?$' -- "$input" | _st_u8t_sel | LC_ALL=C grep -a -c '')"
+            if fc_get u8t "$input"; then u8t_all=$REPLY; else
+                u8t_all="$(LC_ALL=C grep -a -E $'\xd0[\xa0\xa1]\r?$' -- "$input" | _st_u8t_sel | LC_ALL=C grep -a -c '')"
+                fc_put u8t "$input" "$u8t_all"
+            fi
             [[ "$u8t_all" =~ ^[0-9]+$ ]] || u8t_all=0
         fi
         if (( dos_all > 0 )); then
-            dosp_all="$(LC_ALL=C grep -a -E "$DOSP_RE" -- "$input" | _st_dosp_sel | LC_ALL=C grep -a -c '')"
+            if fc_get dosp "$input"; then dosp_all=$REPLY; else
+                dosp_all="$(LC_ALL=C grep -a -E "$DOSP_RE" -- "$input" | _st_dosp_sel | LC_ALL=C grep -a -c '')"
+                fc_put dosp "$input" "$dosp_all"
+            fi
             [[ "$dosp_all" =~ ^[0-9]+$ ]] || dosp_all=0
             dos_all=$(( dos_all + dosp_all ))
         fi
         detect_koi "$input"
         koi_all=$KOI_ALL
+        detect_west "$input"
+        west_all=$WEST_ALL
+        if pq_take cesu "$input"; then cesu_all=$REPLY; else
+            cesu_all="$(LC_ALL=C grep -a -E "$CESU_SEQ" -- "$input" | LC_ALL=C grep -a -c -E "$CESU_LINE")"
+        fi
+        [[ "$cesu_all" =~ ^[0-9]+$ ]] || cesu_all=0
+        (( cesu_all > 0 )) && cesu_sed_build
     fi
+    (( moji_all + dos_all + u8_all + koi_all + s7_all + west_all + cesu_all > 0 )) && gap
     if (( moji_all > 0 )); then
         say "${YELLOW}⚠ Строк с кракозябрами — текстом в UTF-8, который прочитали как Windows-1252: $(fmt_num "$moji_all")${NC}" "${YELLOW}⚠ Mojibake lines — UTF-8 text read as Windows-1252: $(fmt_num "$moji_all")${NC}"
         LC_ALL=C grep -a -E "$MOJI_LEAD" -- "$input" | LC_ALL=C grep -a -E "$MOJI_RE" \
@@ -2273,6 +3054,15 @@ prep_questions() {
         say "  Решает частота сочетаний букв: настоящее слово заглавными изредка тоже будет переведено, короткое — чаще. Если таких слов в файле много, откажитесь." "  Letter pair frequencies decide: a real word in capitals is sometimes converted too, a short one more often. If the file has many such words, say no."
         (( KOI_REST > 0 )) && say "  Ещё строк заглавными, не похожих на такой текст: $(fmt_num "$KOI_REST") — их не трогаю." "  Other lines in capitals that do not look like such text: $(fmt_num "$KOI_REST") — they stay as they are."
     fi
+    if (( west_all > 0 )); then
+        say "${YELLOW}⚠ Строк с кракозябрами — западным текстом (немецким, французским…) в Windows-1252, который прочитали как Windows-1251: $(fmt_num "$west_all")${NC}" "${YELLOW}⚠ Mojibake lines — Western text (German, French…) in Windows-1252 read as Windows-1251: $(fmt_num "$west_all")${NC}"
+        LC_ALL=C grep -a -E "$WEST_LX" -- "$input" | _st_west_sel | moji_examples _st_unmoji
+        say "  Буква с диакритикой стала русской: ü → ь, ö → ц, ä → д, é → й, ß → Я, æ → ж. Беру только строки, где такие буквы стоят среди латиницы; буквы, похожие на латинские (а, е, о, р, с…), не трогаю: с ними это обычный пароль." "  A letter with a diacritic became a Russian one: ü → ь, ö → ц, ä → д, é → й, ß → Я, æ → ж. Only lines where such letters stand among Latin ones are taken; letters that look Latin (а, е, о, р, с…) are left alone: with them it is an ordinary password."
+    fi
+    if (( cesu_all > 0 )); then
+        say "${YELLOW}⚠ Строк с кракозябрами — эмодзи в CESU-8 (так их пишут Java и часть программ Windows), которые прочитали как Windows-1251: $(fmt_num "$cesu_all")${NC}" "${YELLOW}⚠ Mojibake lines — emoji in CESU-8 (as Java and some Windows programs write them) read as Windows-1251: $(fmt_num "$cesu_all")${NC}"
+        LC_ALL=C grep -a -E "$CESU_SEQ" -- "$input" | LC_ALL=C grep -a -E "$CESU_LINE" | moji_examples _st_unmoji
+    fi
     if (( s7_all > 0 )); then
         s7_sed_build "$s7_cr_letter"
         say "${YELLOW}⚠ Похоже на русский текст в DOS-кодировке (CP866), у которого потерян старший бит: буква «а» стала пробелом, другие буквы — знаками. Таких строк: $(fmt_num "$s7_all")${NC}" "${YELLOW}⚠ Looks like Russian text in DOS encoding (CP866) that lost its high bit: the letter «а» became a space, other letters became symbols. Such lines: $(fmt_num "$s7_all")${NC}"
@@ -2281,7 +3071,7 @@ prep_questions() {
         (( s7_keep > 0 )) && say "  Строк с цифрами или латиницей: $(fmt_num "$s7_keep") — их не трогаю: в них не отличить букву от настоящего знака." "  Lines with digits or Latin letters: $(fmt_num "$s7_keep") — they stay as they are: there a letter cannot be told from a real sign."
         (( s7_lat > 0 )) && say "  Раз в файле есть и настоящая латиница, слова только из букв a–o среди неё тоже станут русскими." "  Since the file also has real Latin text, its words made only of the letters a–o also become Russian."
     fi
-    if (( moji_all + dos_all + u8_all + koi_all + s7_all > 0 )); then
+    if (( moji_all + dos_all + u8_all + koi_all + s7_all + west_all + cesu_all > 0 )); then
         L q "Восстановить кракозябры в нормальный текст?" "Restore the mojibake to normal text?"
         if confirm_action "$q" y; then
             do_moji=true
@@ -2294,10 +3084,13 @@ prep_questions() {
     local shy_src=cat
     $do_moji && shy_src=_st_unmoji
     if [[ -z "$enc16" ]]; then
-        shy_all="$(LC_ALL=C grep -a -E $'\xc2\xad' -- "$input" | $shy_src | _shy_sel | LC_ALL=C grep -a -c '')"
+        if pq_take shy "$input" && (( REPLY == 0 )); then shy_all=0; else
+            shy_all="$(LC_ALL=C grep -a -E $'\xc2\xad' -- "$input" | $shy_src | _shy_sel | LC_ALL=C grep -a -c '')"
+        fi
         [[ "$shy_all" =~ ^[0-9]+$ ]] || shy_all=0
     fi
     if (( shy_all > 0 )); then
+        gap
         say "${YELLOW}⚠ Строк с невидимым мягким переносом (U+00AD) внутри слова: $(fmt_num "$shy_all") — с ним слово не совпадёт с тем, что набирают${NC}" "${YELLOW}⚠ Lines with an invisible soft hyphen (U+00AD) inside a word: $(fmt_num "$shy_all") — with it the word does not match what people type${NC}"
         local -a shy_ex=()
         mapfile -t shy_ex < <(LC_ALL=C grep -a -E $'\xc2\xad' -- "$input" | $shy_src | _shy_sel | LC_ALL=C grep -a -m 3 -E '^.{1,60}$' \
@@ -2309,7 +3102,9 @@ prep_questions() {
     fi
 
     if [[ -z "$enc16" ]]; then
-        cr_mid="$(LC_ALL=C grep -a -U -c "${CR_CHR}." -- "$input" 2>/dev/null)"
+        if pq_take crmid "$input"; then cr_mid=$REPLY; else
+            cr_mid="$(LC_ALL=C grep -a -U -c "${CR_CHR}." -- "$input" 2>/dev/null)"
+        fi
         [[ "$cr_mid" =~ ^[0-9]+$ ]] || cr_mid=0
         if $do_moji && (( s7_all > 0 && cr_mid > 0 )); then
             cr_mid="$(LC_ALL=C grep -a -U "${CR_CHR}." -- "$input" | LC_ALL=C grep -a -U -c -v -P "$S7_LINE_RE")"
@@ -2320,6 +3115,7 @@ prep_questions() {
         mapfile -t cr_ex < <(LC_ALL=C grep -a -U "${CR_CHR}." -- "$input" \
                                  | { if $do_moji && (( s7_all > 0 )); then LC_ALL=C grep -a -U -v -P "$S7_LINE_RE"; else cat; fi; } \
                                  | LC_ALL=C grep -a -U -m 3 -E '^.{1,40}$' | ctrl_visible)
+        gap
         say "${YELLOW}⚠ Строк с символом CR внутри строки: $(fmt_num "$cr_mid") — редакторы показывают его как перенос, и одна строка выглядит как две${NC}" "${YELLOW}⚠ Lines with a CR inside the line: $(fmt_num "$cr_mid") — editors show it as a line break, so one line looks like two${NC}"
         (( ${#cr_ex[@]} > 0 )) && say "  Например (␍ — CR):" "  For example (␍ is CR):"
         for l in "${cr_ex[@]}"; do
@@ -2334,7 +3130,9 @@ prep_questions() {
     fi
 
     if [[ -z "$enc16" ]]; then
-        ctrl_all="$(LC_ALL=C grep -a -c -e "$CTRL_RE" -e "$C1_RE" -- "$input" 2>/dev/null)"
+        if pq_take ctrl "$input"; then ctrl_all=$REPLY; else
+            ctrl_all="$(LC_ALL=C grep -a -c -e "$CTRL_RE" -e "$C1_RE" -- "$input" 2>/dev/null)"
+        fi
         [[ "$ctrl_all" =~ ^[0-9]+$ ]] || ctrl_all=0
         if $do_moji && (( ctrl_all > 0 )); then
             ctrl_all="$(LC_ALL=C grep -a -e "$CTRL_RE" -e "$C1_RE" -- "$input" | _st_unmoji \
@@ -2346,42 +3144,65 @@ prep_questions() {
         mapfile -t ctrl_ex < <(LC_ALL=C grep -a -e "$CTRL_RE" -e "$C1_RE" -- "$input" \
                                    | { if $do_moji; then _st_unmoji | LC_ALL=C grep -a -e "$CTRL_RE" -e "$C1_RE"; else cat; fi; } \
                                    | LC_ALL=C grep -a -m 3 -E '^.{1,40}$' | ctrl_visible)
+        gap
         say "${YELLOW}⚠ Строк с управляющими символами: $(fmt_num "$ctrl_all") — в редакторе это непонятные значки${NC}" "${YELLOW}⚠ Lines with control characters: $(fmt_num "$ctrl_all") — odd symbols in an editor${NC}"
         (( ${#ctrl_ex[@]} > 0 )) && say "  Например (␁…␟, ␡ — коды 01–1F и 7F, □ — U+0080–U+009F, � — байт не в UTF-8):" "  For example (␁…␟, ␡ are codes 01–1F and 7F, □ is U+0080–U+009F, � is a byte that is not UTF-8):"
         for l in "${ctrl_ex[@]}"; do
             say "   «${l//\\/\\\\}»"
         done
-        say "  Их уберёт проверка UTF-8 (следующий вопрос)" "  The UTF-8 check removes them (the next question)"
+        if $PREP_ANALYZE; then say "  Их уберёт проверка UTF-8 в пункте 2" "  The UTF-8 check of item 2 removes them"
+        else say "  Их уберёт проверка UTF-8 (следующий вопрос)" "  The UTF-8 check removes them (the next question)"; fi
     fi
 
-    local utf8_default=n src
+    local utf8_default=n src enc_def=""
     local enc_prompt
-    L enc_prompt "Если файл в другой кодировке — укажите её (например WINDOWS-1251), Enter — просто убрать нечитаемое: " "If the file is in another encoding, type it (for example WINDOWS-1251); Enter — just remove unreadable lines: "
     if [[ -n "$enc16" && -z "$enc" ]]; then
-        utf8_default=y
-        L enc_prompt "Если файл в другой кодировке — укажите её (например WINDOWS-1251), Enter — сконвертировать из ${enc16}: " "If the file is in another encoding, type it (for example WINDOWS-1251); Enter — convert from ${enc16}: "
+        utf8_default=y; enc_def="$enc16"
     elif [[ -n "$enc8" ]]; then
-        utf8_default=y
-        L enc_prompt "Если файл в другой кодировке — укажите её (например WINDOWS-1251), Enter — сконвертировать из ${enc8}: " "If the file is in another encoding, type it (for example WINDOWS-1251); Enter — convert from ${enc8}: "
+        utf8_default=y; enc_def="$enc8"
     fi
-    local lines_all=0 pct
+    local lines_all=0 pct le_rest
+    $PREP_ANALYZE || gap
     if [[ -z "$enc16" && -z "$enc" && -z "$enc8" ]] && ! $do_mix && (( D8_BAD > 0 )); then
+        $PREP_ANALYZE && gap
         bad_utf8=$D8_BAD
-        lines_all="$(wc -l < "$input")"
-        [[ "$lines_all" =~ ^[0-9]+$ ]] && (( lines_all >= bad_utf8 )) || lines_all=$bad_utf8
+        if $do_lineenc && (( D8M_N > 0 )); then
+            le_rest=$(( D8M_OTHER + D8M_UNSURE + D8M_WEST - D8M_WOK ))
+            local s8=0
+            $do_shy8 || s8=$shy8_all
+            (( s8 <= D8_BAD )) || s8=$D8_BAD
+            bad_utf8=$(( ((D8_BAD - s8) * le_rest + D8M_N / 2) / D8M_N + s8 ))
+            (( le_rest > 0 && bad_utf8 == 0 )) && bad_utf8=1
+        fi
+        if pq_take lines "$input"; then lines_all=$REPLY; else lines_all="$(wc -l < "$input")"; fi
+        [[ "$lines_all" =~ ^[0-9]+$ ]] && (( lines_all >= bad_utf8 && lines_all > 0 )) || lines_all=$(( bad_utf8 > 0 ? bad_utf8 : 1 ))
         pct=$(( (bad_utf8 * 1000 + lines_all / 2) / lines_all ))
         if (( pct < 10 )); then pct="< 1"; L pct "${pct}" "${pct}"
         elif (( pct < 100 )); then L pct "$(( pct / 10 )),$(( pct % 10 ))" "$(( pct / 10 )).$(( pct % 10 ))"
         else pct=$(( (pct + 5) / 10 )); fi
-        say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$bad_utf8") — проверка их уберёт (${pct} % файла). Если в них нужный текст, укажите кодировку или сохраните их отдельным файлом (вопрос ниже)${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$bad_utf8") — the check removes them (${pct}% of the file). If they hold text you need, type the encoding or save them to a separate file (a later question)${NC}"
-        bad_utf8_mix "$input" "$bad_utf8"
+        if $do_lineenc; then
+            (( bad_utf8 > 0 )) && say "${YELLOW}⚠ Строк не в UTF-8 после перевода останется примерно $(fmt_num "$bad_utf8") (по выборке) — проверка их уберёт (${pct} % файла). Сохранить их можно отдельным файлом (${AN_Q_R})${NC}" "${YELLOW}⚠ About $(fmt_num "$bad_utf8") lines will still be not in UTF-8 after conversion (by the sample) — the check removes them (${pct}% of the file). You can save them to a separate file (${AN_Q_E})${NC}"
+        else
+            say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$bad_utf8") — проверка их уберёт (${pct} % файла). Если в них нужный текст, укажите кодировку или сохраните их отдельным файлом (${AN_Q_R})${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$bad_utf8") — the check removes them (${pct}% of the file). If they hold text you need, type the encoding or save them to a separate file (${AN_Q_E})${NC}"
+            if $le_offered; then bad_utf8_mix "$input" "$D8_BAD" short; else bad_utf8_mix "$input" "$bad_utf8"; fi
+        fi
     fi
+    if [[ -z "$enc_def" && -n "$enc_hint" ]] && ! $do_lineenc; then
+        utf8_default=y; enc_def="$enc_hint"
+    fi
+    if [[ -n "$enc_def" ]]; then
+        L enc_prompt "Если файл в другой кодировке — укажите её, Enter — перевести из ${enc_def}, «-» — без перевода, просто убрать нечитаемое: " "If the file is in another encoding, type it; Enter — convert from ${enc_def}; «-» — no conversion, just remove unreadable lines: "
+    else
+        L enc_prompt "Если файл в другой кодировке — укажите её (например WINDOWS-1251), Enter — просто убрать нечитаемое: " "If the file is in another encoding, type it (for example WINDOWS-1251); Enter — just remove unreadable lines: "
+    fi
+    $CONFIRM_AUTO && utf8_default=y
+    $do_lineenc && utf8_default=y
     L q "Проверить на валидность UTF-8 и убрать нечитаемые строки?" "Check for valid UTF-8 and remove unreadable lines?"
     if confirm_action "$q" "$utf8_default"; then
         do_utf8=true
         if [[ -n "$enc" ]]; then
             :
-        elif $do_mix; then
+        elif $do_mix || $do_lineenc; then
             :
         elif ! command -v iconv >/dev/null 2>&1; then
             say "${YELLOW}⚠ iconv не найден — только проверка, без конвертации${NC}" "${YELLOW}⚠ iconv not found — only the check, no conversion${NC}"
@@ -2389,17 +3210,24 @@ prep_questions() {
             while true; do
                 ask_value "$enc_prompt" ""
                 src="$REPLY"
-                [[ -z "$src" && -n "$enc16" ]] && src="$enc16"
-                [[ -z "$src" && -n "$enc8" ]] && src="$enc8"
+                [[ -z "$src" ]] && src="$enc_def"
+                case "$src" in -|—|нет|Нет|НЕТ|no|No|NO|n|N) src="" ;; esac
                 if [[ -z "$src" ]]; then
                     if (( bad_utf8 > 0 && bad_utf8 * 100 >= lines_all * 99 )); then
-                        say "${YELLOW}⚠ Почти весь файл не в UTF-8 (строк: $(fmt_num "$bad_utf8") из $(fmt_num "$lines_all")): без кодировки проверка уберёт их все${NC}" "${YELLOW}⚠ Almost the whole file is not in UTF-8 ($(fmt_num "$bad_utf8") lines of $(fmt_num "$lines_all")): without an encoding the check removes them all${NC}"
+                        if (( bad_utf8 >= lines_all )); then
+                            say "${YELLOW}⚠ Весь файл не в UTF-8 (строк: $(fmt_num "$bad_utf8")): без кодировки проверка уберёт их все${NC}" "${YELLOW}⚠ The whole file is not in UTF-8 ($(fmt_num "$bad_utf8") lines): without an encoding the check removes them all${NC}"
+                        else
+                            say "${YELLOW}⚠ Почти весь файл не в UTF-8 (строк: $(fmt_num "$bad_utf8") из $(fmt_num "$lines_all")): без кодировки проверка уберёт их все${NC}" "${YELLOW}⚠ Almost the whole file is not in UTF-8 ($(fmt_num "$bad_utf8") lines of $(fmt_num "$lines_all")): without an encoding the check removes them all${NC}"
+                        fi
+                        $PREP_ANALYZE && break
+                        if $CONFIRM_AUTO; then CONFIRM_AUTO=false; continue; fi
                         L q "Всё равно убрать их?" "Remove them anyway?"
                         confirm_action "$q" n || continue
                     fi
                     break
                 fi
                 if iconv_known "$src"; then
+                    [[ -z "$enc16" ]] && enc_only_bad "$src" && break
                     enc="$src"
                     break
                 fi
@@ -2417,7 +3245,8 @@ prep_questions() {
         $do_moji && $s7_cr_letter && blank_re='^$'
         case "${enc^^}" in
             UTF-16*|UCS-*|UTF-32*) blank_all="$(iconv -f "$enc" -t UTF-8 -c < "$input" 2>/dev/null | LC_ALL=C grep -a -U -c -P "$blank_re")" ;;
-            *) blank_all="$(LC_ALL=C grep -a -U -c -P "$blank_re" -- "$input" 2>/dev/null)" ;;
+            *) if [[ "$blank_re" == "$BLANK_RE" ]] && pq_take blank "$input"; then blank_all=$REPLY
+               else blank_all="$(LC_ALL=C grep -a -U -c -P "$blank_re" -- "$input" 2>/dev/null)"; fi ;;
         esac
         [[ "$blank_all" =~ ^[0-9]+$ ]] || blank_all=0
         if $do_crsplit; then
@@ -2427,11 +3256,16 @@ prep_questions() {
         fi
     fi
     if (( blank_all > 0 )); then
+        gap
         say "${YELLOW}⚠ Пустых строк и строк из одних пробелов или табов: $(fmt_num "$blank_all")${NC}" "${YELLOW}⚠ Empty lines and lines of only spaces or tabs: $(fmt_num "$blank_all")${NC}"
         L q "Убрать их?" "Remove them?"
         confirm_action "$q" y && do_blank=true
     fi
 
+    CONFIRM_AUTO=false
+    $PREP_ANALYZE && return 0
+
+    gap
     L q "Фильтровать строки по длине?" "Filter lines by length?"
     if confirm_action "$q" n; then
         L q "Минимальная длина строки [8]: " "Minimum line length [8]: "; ask_value "$q" 8; min="$REPLY"
@@ -2444,7 +3278,8 @@ prep_questions() {
         fi
     fi
 
-    L q "Удалить строки, состоящие только из цифр?" "Remove lines made of digits only?"
+    gap
+    L q "Удалить строки только из цифр (какой длины — следующий вопрос)?" "Remove lines made of digits only (which length — the next question)?"
     if confirm_action "$q" n; then
         do_dig=true
         local dv dlo dhi
@@ -2484,6 +3319,7 @@ prep_questions() {
         $do_len && (( min > 1 )) && { L t ", короче ${min} — в ${sb}_short.txt" ", shorter than ${min} to ${sb}_short.txt"; what+="$t"; }
         $do_dig && { L t ", из цифр (${dig_name}) — в ${sb}_digits.txt" ", digits (${dig_name}) to ${sb}_digits.txt"; what+="$t"; }
         $do_utf8 && (( bad_utf8 > 0 )) && { L t ", не в UTF-8 — в ${sb}_notutf8.txt (как есть, с повторами)" ", not in UTF-8 to ${sb}_notutf8.txt (as they are, with duplicates)"; what+="$t"; }
+        gap
         say "  Убранные строки можно сохранить в отдельные файлы${what/#,/:}" "  Removed lines can be saved to separate files${what/#,/:}"
         L q "Сохранить убранные строки в отдельные файлы?" "Save the removed lines to separate files?"
         if confirm_action "$q" n; then
@@ -2493,17 +3329,32 @@ prep_questions() {
 }
 
 # Explain why a result converted from a single-byte encoding is bigger than the source.
+# Explain why a result converted from a single-byte encoding is bigger than the source.
 size_note() {
-    local e="" in_s out_s why
+    local e="" in_s out_s why x cyr=false lat=false
+    local -a xs=()
     L why "знаки не латиницы занимают 2–3 байта, а не 1" "non-Latin characters take 2–3 bytes instead of 1"
-    if [[ -n "$enc" ]]; then e="$enc"; elif $do_mix; then e="$mix_enc"; elif $do_moji && (( s7_all > 0 )); then e=CP866; fi
+    if [[ -n "$enc" ]]; then e="$enc"; elif $do_mix; then e="$mix_enc"; elif $do_lineenc; then e="$lineenc_encs"
+    elif $do_moji && (( s7_all > 0 )); then e=CP866; fi
     [[ -n "$e" ]] || return 0
     case "${e^^}" in UTF-*|UCS-*) return 0 ;; esac
     in_s=$(file_size "$1"); out_s=$(file_size "$2")
     (( out_s > in_s )) || return 0
-    case "${e^^}" in
-        *1251*|KOI8*|*866*|*8859-5*|MAC*CYR*|*855*) L why "русская буква занимает 2 байта, а не 1" "a Cyrillic letter takes 2 bytes instead of 1" ;;
-    esac
+    IFS=, read -ra xs <<< "${e^^}"
+    for x in "${xs[@]}"; do
+        x="${x# }"
+        case "$x" in
+            *1251*|KOI8*|*866*|*8859-5|MAC*CYR*|*855*) cyr=true ;;
+            *1250*|*1252*|*1254*|*1257*|*8859-1|*8859-2|*8859-9|*8859-13|*8859-15|LATIN*) lat=true ;;
+        esac
+    done
+    if $cyr && $lat; then
+        L why "русская буква и буква с диакритикой занимают 2 байта, а не 1" "a Cyrillic letter and a letter with a diacritic take 2 bytes instead of 1"
+    elif $cyr; then
+        L why "русская буква занимает 2 байта, а не 1" "a Cyrillic letter takes 2 bytes instead of 1"
+    elif $lat; then
+        L why "буква с диакритикой (ä, é, ł) занимает 2 байта, а не 1" "a letter with a diacritic (ä, é, ł) takes 2 bytes instead of 1"
+    fi
     say "  Больше исходника ($(fmt_size "$in_s") в ${e}): в UTF-8 ${why}" "  Bigger than the source ($(fmt_size "$in_s") in ${e}): in UTF-8 ${why}"
 }
 
@@ -2517,9 +3368,9 @@ prep_file() {
     L dig_name "любой длины" "of any length"
     local nul_all=0 nul_word=0 nul_left=0 l
     local ctrl_all=0 feff_mid=0 moji_all=0 dos_all=0 u8_all=0 do_moji=false koi_all=0 dosp_all=0 bad_utf8=0
-    local u8t_all=0 shy_all=0 do_shy=false
+    local u8t_all=0 shy_all=0 do_shy=false shy8_all=0 do_shy8=false west_all=0 cesu_all=0
     local s7_all=0 s7_keep=0 s7_lat=0 s7_nul=0 s7_cr_letter=false cr_mid=0 do_crsplit=false blank_all=0 do_blank=false
-    local enc8="" do_mix=false mix_all=0 mix_enc=""
+    local enc8="" enc_hint="" do_mix=false mix_all=0 mix_enc="" do_lineenc=false lineenc_all=0 lineenc_encs="" le_offered=false
     local hole_set="" hole_all=0 hole_keep=false
     local -a nul_ex=() ctrl_ex=() cr_ex=()
     local strip_stage=_st_strip_all final="" k
@@ -2538,7 +3389,7 @@ prep_file() {
         prep_questions
     fi
 
-    if [[ "$mode" != clean ]]; then
+    if [[ "$mode" == full || "$mode" == compare ]]; then
         [[ "$mode" == full ]] && { prepare_refs || return 1; }
         for k in "${!CMP_REFS[@]}"; do
             [[ -n "${CMP_SKIP[k]:-}" ]] && continue
@@ -2556,8 +3407,8 @@ prep_file() {
     $do_blank && nf=$((nf + 1))
     $do_len && nf=$((nf + 1))
     $do_dig && nf=$((nf + 1))
-    [[ "$mode" != clean ]] && nf=$((nf + 1 + ${#P_REFS[@]}))
-    if [[ -z "$enc" ]] && ! $do_mix && ! $do_strip && ! $do_nul && ! $do_moji && ! $do_crsplit && ! $do_shy && (( nf == 0 )); then
+    [[ "$mode" == full || "$mode" == compare ]] && nf=$((nf + 1 + ${#P_REFS[@]}))
+    if [[ "$mode" != analyze && -z "$enc" ]] && ! $do_mix && ! $do_lineenc && ! $do_strip && ! $do_nul && ! $do_moji && ! $do_crsplit && ! $do_shy && ! $do_shy8 && (( nf == 0 )); then
         say "\n${BLUE}Делать нечего — прохода нет, дальше идёт сам файл ${input}${NC}" "\n${BLUE}Nothing to do — no pass, the file ${input} goes on as is${NC}"
         PREP_RESULT="$input"
         return 0
@@ -2569,27 +3420,38 @@ prep_file() {
 
     if [[ "$mode" == clean ]]; then
         say "\n${GREEN}=== Подготовка: один проход ===${NC}" "\n${GREEN}=== Preparation: one pass ===${NC}"
+    elif [[ "$mode" == analyze ]]; then
+        say "\n${GREEN}=== Проход без записи: что останется и из чего ===${NC}" "\n${GREEN}=== A pass without writing: what is left and what it is made of ===${NC}"
     else
         say "\n${GREEN}=== Один проход до итога ===${NC}" "\n${GREEN}=== One pass to the result ===${NC}"
     fi
-    if [[ "$mode" != clean ]]; then
-        if ! output="$(mktemp "./.dedup_tool.XXXXXX" 2>/dev/null)"; then
-            say "${RED}✘ Не удалось создать временный файл для ${final}${NC}" "${RED}✘ Could not create a temporary file for ${final}${NC}" >&2
+    if [[ "$mode" == analyze ]]; then
+        output=""
+        if [[ ! -r "$input" ]]; then
+            say "${RED}✘ Не читается ${input}${NC}" "${RED}✘ Cannot read ${input}${NC}" >&2
+            return 1
+        fi
+        IN_PROGRESS=()
+    else
+        if [[ "$mode" != clean ]]; then
+            if ! output="$(mktemp "./.dedup_tool.XXXXXX" 2>/dev/null)"; then
+                say "${RED}✘ Не удалось создать временный файл для ${final}${NC}" "${RED}✘ Could not create a temporary file for ${final}${NC}" >&2
+                return 1
+            fi
+            IN_PROGRESS=("$output")
+        fi
+        if [[ ! -r "$input" ]] || ! : > "$output" 2>/dev/null; then
+            say "${RED}✘ Не читается ${input} или не пишется ${output}${NC}" "${RED}✘ Cannot read ${input} or write ${output}${NC}" >&2
+            [[ "$mode" != clean ]] && rm -f -- "$output"
+            IN_PROGRESS=()
             return 1
         fi
         IN_PROGRESS=("$output")
     fi
-    if [[ ! -r "$input" ]] || ! : > "$output" 2>/dev/null; then
-        say "${RED}✘ Не читается ${input} или не пишется ${output}${NC}" "${RED}✘ Cannot read ${input} or write ${output}${NC}" >&2
-        [[ "$mode" != clean ]] && rm -f -- "$output"
-        IN_PROGRESS=()
-        return 1
-    fi
-    IN_PROGRESS=("$output")
 
-    local fdir="" k use_counts=false
+    local fdir="" k use_counts=false P_LE=""
     local -a P_FIFO=() pids=()
-    if (( nf > 0 )); then
+    if (( nf > 0 )) || [[ "$mode" == analyze ]] || $do_lineenc; then
         if fdir="$(mktemp -d "${TMPDIR:-/tmp}/dedup_tool.XXXXXX" 2>/dev/null)"; then
             TMP_DIRS=("$fdir")
             use_counts=true
@@ -2604,6 +3466,7 @@ prep_file() {
             say "${YELLOW}⚠ Не удалось создать FIFO для счётчиков строк — статистика будет только итоговая${NC}" "${YELLOW}⚠ Could not create FIFOs for line counters — only the total will be shown${NC}"
         fi
     fi
+    $do_lineenc && $use_counts && P_LE="$fdir/le"
     local -a P_SAVE=() save_tmp=()
     local save_short=false save_dig=false save_bad=false sdir
     if $do_save; then
@@ -2635,10 +3498,18 @@ prep_file() {
     fi
 
     local -a stages=() names=() steps=() filt=()
-    local fi_n=0 nul_re=""
+    local fi_n=0 fi_bad=0 nul_re=""
+    if $do_shy8; then
+        stages+=(_st_shy8); names+=(sed)
+        L t "мягкий перенос (байт AD) убран" "soft hyphen (the byte AD) removed"; steps+=("$t")
+    fi
     if $do_mix; then
         L t "строки не в UTF-8 (${mix_enc} → UTF-8)" "lines not in UTF-8 (${mix_enc} → UTF-8)"
         stages+=(_st_mix); names+=(sed); steps+=("$t")
+    fi
+    if $do_lineenc; then
+        L t "строки не в UTF-8 → UTF-8, каждая из своей кодировки" "lines not in UTF-8 → UTF-8, each from its own encoding"
+        stages+=(_st_lineenc); names+=(awk); steps+=("$t")
     fi
     if [[ -n "$enc" ]]; then
         stages+=(_st_iconv); names+=(iconv); steps+=("iconv (${enc} → UTF-8)")
@@ -2647,6 +3518,8 @@ prep_file() {
         stages+=("$strip_stage"); names+=(sed); steps+=("CRLF/BOM")
     fi
     if $do_moji; then
+        (( west_all > 0 )) && { stages+=(_st_west); names+=(sed); }
+        (( cesu_all > 0 )) && { stages+=(_st_cesu); names+=(sed); }
         (( moji_all > 0 )) && { stages+=(_st_moji); names+=(sed); }
         (( dos_all + u8_all > 0 )) && { stages+=(_st_cyr); names+=(sed); }
         (( moji_all + u8_all > 0 )) && { stages+=(_st_moji _st_cyr2); names+=(sed sed); }
@@ -2674,6 +3547,7 @@ prep_file() {
         fi
         stages+=(_st_fffd); names+=(grep)
         L t "проверка UTF-8" "UTF-8 check"; steps+=("$t")
+        fi_bad=$fi_n
         if (( nul_left > 0 )); then L t "нечитаемые (не UTF-8, U+FFFD или NUL)" "unreadable (not UTF-8, U+FFFD or NUL)"; filt+=("$t")
         else L t "нечитаемые (не UTF-8 или U+FFFD)" "unreadable (not UTF-8 or U+FFFD)"; filt+=("$t"); fi
         fi_n=$((fi_n + 1))
@@ -2712,7 +3586,17 @@ prep_file() {
         stages+=(_st_dig); names+=(grep)
         L t "только цифры (${dig_name})" "digits only (${dig_name})"; steps+=("$t"); filt+=("$t")
     fi
-    if [[ "$mode" != clean ]]; then
+    local P_AN="" P_AN_STEP=1
+    if [[ "$mode" == analyze ]]; then
+        if [[ -z "$fdir" ]]; then
+            say "${RED}✘ Не удалось создать временную папку для счёта${NC}" "${RED}✘ Could not create a temporary folder for the counts${NC}" >&2
+            return 1
+        fi
+        P_AN="$fdir/an"
+        P_AN_STEP=$(( $(file_size "$input") / 33554432 + 1 ))
+        stages+=(_st_an_stats); names+=(awk)
+    fi
+    if [[ "$mode" == full || "$mode" == compare ]]; then
         sort_opts
         fi_n=$((fi_n + 1))
         $use_counts && { stages+=("_st_count $fi_n"); names+=(tee); }
@@ -2740,6 +3624,9 @@ prep_file() {
     done
     if [[ "$mode" == clean ]]; then
         say "${BLUE}${line} ${output}${NC}"
+    elif [[ "$mode" == analyze ]]; then
+        L t "счёт (без записи)" "counting (nothing written)"
+        say "${BLUE}${line} ${t}${NC}"
     elif (( ${#P_REFS[@]} > 3 )); then
         L t "эталоны: ${#P_REFS[@]}" "references: ${#P_REFS[@]}"
         out "${BLUE}${lshort} ${t} → ${final}${NC}"
@@ -2748,7 +3635,14 @@ prep_file() {
         say "${BLUE}${line} ${final}${NC}"
     fi
 
-    if $use_counts; then
+    local an_cached=false an_c="" an_p="" an_le="" an_dt=0
+    if [[ "$mode" == analyze ]] && $use_counts && fc_get an.nf "$input" && [[ "$REPLY" == "$nf" ]] \
+       && fc_get an.c "$input" && an_c="$REPLY" && fc_get an.p "$input" && an_p="$REPLY" && fc_get an.dt "$input" && an_dt="$REPLY"; then
+        an_cached=true
+        fc_get an.le "$input" && an_le="$REPLY"
+    fi
+
+    if $use_counts && ! $an_cached; then
         for (( k = 1; k <= nf; k++ )); do
             wc -l < "${P_FIFO[k]}" > "$fdir/c$k" &
             pids+=($!)
@@ -2778,17 +3672,30 @@ prep_file() {
     if $hole_keep && [[ -n "$hole_set" ]]; then hole_class "$hole_set" c1; P_C1_RE="$REPLY"; fi
     local pl="${stages[0]} < \"\$P_IN\"" t0
     for (( k = 1; k < ${#stages[@]}; k++ )); do pl+=" | ${stages[k]}"; done
-    pl+=" > \"\$P_OUT\""
+    if [[ "$mode" == analyze ]]; then pl+=" > /dev/null"; else pl+=" > \"\$P_OUT\""; fi
     local -a st=()
     IN_PROGRESS=("$output" "${save_tmp[@]}")
+    [[ "$mode" == analyze ]] && IN_PROGRESS=()
     ms_now; t0=$REPLY
     L t проход pass
-    progress_start "$t" "$(file_size "$input")" read "$input"
-    eval "$pl"'; st=("${PIPESTATUS[@]}")'
-    progress_stop
-    (( ${#pids[@]} > 0 )) && wait "${pids[@]}" 2>/dev/null
-    COUNTER_PIDS=()
-    ms_now
+    if $an_cached; then
+        local -a an_cv=()
+        read -r -a an_cv <<< "$an_c"
+        for (( k = 1; k <= nf; k++ )); do printf '%s\n' "${an_cv[k-1]:-0}" > "$fdir/c$k"; done
+        printf '%s\n' "${an_p//;/$'\n'}" > "$P_AN"
+        [[ -n "$P_LE" && -n "$an_le" ]] && printf '%s\n' "$an_le" > "$P_LE"
+        for k in "${!stages[@]}"; do st[k]=0; done
+        [[ "$an_dt" =~ ^[0-9]+$ ]] || an_dt=0
+        say "  Прохода нет: числа — прежние (тогда проход шёл $(fmt_dur "$an_dt"))" "  No pass: the numbers are the earlier ones (the pass then took $(fmt_dur "$an_dt"))"
+        REPLY=$(( t0 + an_dt ))
+    else
+        progress_start "$t" "$(file_size "$input")" read "$input"
+        eval "$pl"'; st=("${PIPESTATUS[@]}")'
+        progress_stop
+        (( ${#pids[@]} > 0 )) && wait "${pids[@]}" 2>/dev/null
+        COUNTER_PIDS=()
+        ms_now
+    fi
 
     local bad="" dropped=false
     for k in "${!st[@]}"; do
@@ -2799,13 +3706,15 @@ prep_file() {
         esac
     done
     if [[ -n "$bad" ]]; then
-        rm -f -- "$output"
+        [[ -n "$output" ]] && rm -f -- "$output"
         for k in "${!save_tmp[@]}"; do rm -f -- "${save_tmp[k]}"; done
         IN_PROGRESS=()
         [[ -n "$fdir" ]] && rm -rf -- "$fdir"
         TMP_DIRS=()
         if [[ "$mode" == clean ]]; then
             say "${RED}✘ Ошибка подготовки:${bad} — ${output} удалён, исходный файл не тронут${NC}" "${RED}✘ Preparation error:${bad} — ${output} deleted, the source file is untouched${NC}" >&2
+        elif [[ "$mode" == analyze ]]; then
+            say "${RED}✘ Ошибка анализа:${bad}${NC}" "${RED}✘ Analysis error:${bad}${NC}" >&2
         else
             say "${RED}✘ Ошибка прохода:${bad} — итог ${final} не создан, исходный файл не тронут${NC}" "${RED}✘ Pass error:${bad} — the result ${final} is not created, the source file is untouched${NC}" >&2
         fi
@@ -2816,9 +3725,31 @@ prep_file() {
 
     local n_out dt=$(( REPLY - t0 )) nul_line="" feff_line="" moji_line="" mix_line="" cr_line=""
     local -a cnt=()
-    n_out=$(wc -l < "$output")
+    if [[ "$mode" == analyze ]]; then
+        n_out="$(LC_ALL=C sed -n 's/^lines //p' -- "$P_AN" 2>/dev/null)"
+        [[ "$n_out" =~ ^[0-9]+$ ]] || n_out=0
+    else
+        n_out=$(wc -l < "$output")
+    fi
     $do_nul && L nul_line "  ↻ слова из UTF-16 восстановлены (убраны NUL): $(fmt_num "$nul_word")" "  ↻ words from UTF-16 restored (NUL removed): $(fmt_num "$nul_word")"
     $do_mix && L mix_line "  ↻ строки не в UTF-8 перекодированы из ${mix_enc}: $(fmt_num "$mix_all")" "  ↻ lines not in UTF-8 converted from ${mix_enc}: $(fmt_num "$mix_all")"
+    if $do_lineenc && [[ -n "$P_LE" && -s "$P_LE" ]]; then
+        local le_w=0 le_k=0 le_c=0 le_x=0 lk="" lke=""
+        read -r le_w le_k le_c le_x < "$P_LE"
+        lineenc_all=$(( ${le_w:-0} + ${le_k:-0} + ${le_c:-0} + ${le_x:-0} ))
+        (( le_w > 0 )) && { lk+=", WINDOWS-1251 — $(fmt_num "$le_w")"; lke+=", WINDOWS-1251: $(fmt_num "$le_w")"; }
+        (( le_k > 0 )) && { lk+=", KOI8-R — $(fmt_num "$le_k")"; lke+=", KOI8-R: $(fmt_num "$le_k")"; }
+        (( le_c > 0 )) && { lk+=", CP866 — $(fmt_num "$le_c")"; lke+=", CP866: $(fmt_num "$le_c")"; }
+        (( le_x > 0 )) && { lk+=", WINDOWS-1252 — $(fmt_num "$le_x")"; lke+=", WINDOWS-1252: $(fmt_num "$le_x")"; }
+        lineenc_encs=""
+        (( le_w > 0 )) && lineenc_encs+=", WINDOWS-1251"
+        (( le_k > 0 )) && lineenc_encs+=", KOI8-R"
+        (( le_c > 0 )) && lineenc_encs+=", CP866"
+        (( le_x > 0 )) && lineenc_encs+=", WINDOWS-1252"
+        lineenc_encs="${lineenc_encs#, }"
+        L t "  ↻ строки не в UTF-8 переведены, каждая из своей кодировки: $(fmt_num "$lineenc_all")${lk:+ (${lk#, })}" "  ↻ lines not in UTF-8 converted, each from its own encoding: $(fmt_num "$lineenc_all")${lke:+ (${lke#, })}"
+        mix_line="${mix_line:+${mix_line}\n}${t}"
+    fi
     if $hole_keep && (( hole_all > 0 )); then
         local hl="${hole_set^^}"; hl="${hl// /, }"
         L t "  ↻ строк, где байт ${hl} оставлен невидимым знаком для второго шага: $(fmt_num "$hole_all") — пункт 2 на результате, «Восстановить кракозябры» — да" "  ↻ lines where the byte ${hl} is kept as an invisible character for the second step: $(fmt_num "$hole_all") — item 2 on the result, «Restore the mojibake» — yes"
@@ -2826,6 +3757,7 @@ prep_file() {
     fi
     $do_crsplit && L cr_line "  ↻ строки с CR внутри разбиты: $(fmt_num "$cr_mid")" "  ↻ lines with a CR inside split: $(fmt_num "$cr_mid")"
     [[ -z "$enc" ]] && $do_strip && (( feff_mid > 0 )) && L feff_line "  ↻ невидимый U+FEFF убран из строк: $(fmt_num "$feff_mid")" "  ↻ invisible U+FEFF removed from lines: $(fmt_num "$feff_mid")"
+    $do_shy8 && L feff_line "${feff_line:+${feff_line}\n}  ↻ мягкий перенос (байт AD) убран из латинских слов: $(fmt_num "$shy8_all")" "${feff_line:+${feff_line}\n}  ↻ soft hyphen (the byte AD) removed from Latin words: $(fmt_num "$shy8_all")"
     $do_shy && L feff_line "${feff_line:+${feff_line}\n}  ↻ мягкий перенос убран из строк: $(fmt_num "$shy_all")" "${feff_line:+${feff_line}\n}  ↻ soft hyphen removed from lines: $(fmt_num "$shy_all")"
     if [[ -z "$enc" ]] && $do_moji; then
         local mk="" kinds=0
@@ -2843,7 +3775,10 @@ prep_file() {
         fi
         (( koi_all > 0 )) && { L t ", KOI8-R как Windows-1251 — $(fmt_num "$koi_all")" ", KOI8-R as Windows-1251: $(fmt_num "$koi_all")"; mk+="$t"; kinds=$((kinds + 1)); }
         (( s7_all > 0 )) && { L t ", CP866 без старшего бита — $(fmt_num "$s7_all")" ", CP866 without the high bit: $(fmt_num "$s7_all")"; mk+="$t"; kinds=$((kinds + 2)); }
-        L moji_line "  ↻ кракозябры восстановлены: $(fmt_num $(( moji_all + dos_all + u8_all + koi_all + s7_all )))" "  ↻ mojibake restored: $(fmt_num $(( moji_all + dos_all + u8_all + koi_all + s7_all )))"
+        (( west_all > 0 )) && { L t ", западный текст как Windows-1251 — $(fmt_num "$west_all")" ", Western text as Windows-1251: $(fmt_num "$west_all")"; mk+="$t"; kinds=$((kinds + 1)); }
+        (( cesu_all > 0 )) && { L t ", эмодзи в CESU-8 — $(fmt_num "$cesu_all")" ", emoji in CESU-8: $(fmt_num "$cesu_all")"; mk+="$t"; kinds=$((kinds + 1)); }
+        k=$(( moji_all + dos_all + u8_all + koi_all + s7_all + west_all + cesu_all ))
+        L moji_line "  ↻ кракозябры восстановлены: $(fmt_num "$k")" "  ↻ mojibake restored: $(fmt_num "$k")"
         (( kinds > 1 )) && moji_line+=" (${mk#, })"
     fi
     if $use_counts; then
@@ -2875,6 +3810,22 @@ prep_file() {
         [[ -n "$cr_line" ]] && say "$cr_line"
         [[ -n "$nul_line" ]] && say "$nul_line"
     fi
+    if [[ "$mode" == analyze ]]; then
+        say "${GREEN}✔ После подготовки с ответами по умолчанию осталось бы строк: $(fmt_num "$n_out") (проход $(fmt_dur "$dt"))${NC}" "${GREEN}✔ After preparation with the default answers, lines left: $(fmt_num "$n_out") (pass $(fmt_dur "$dt"))${NC}"
+        analyze_report
+        if ! $an_cached && $use_counts && [[ -s "$P_AN" ]]; then
+            local an_cs="" an_ps="" an_ls=""
+            for (( k = 1; k <= nf; k++ )); do an_cs+=" ${cnt[k]}"; done
+            an_ps="$(LC_ALL=C tr '\n' ';' < "$P_AN")"; an_ps="${an_ps%;}"
+            [[ -n "$P_LE" && -s "$P_LE" ]] && read -r an_ls < "$P_LE"
+            fc_put an.nf "$input" "$nf"; fc_put an.c "$input" "${an_cs# }"; fc_put an.p "$input" "$an_ps"; fc_put an.dt "$input" "$dt"
+            [[ -n "$an_ls" ]] && fc_put an.le "$input" "$an_ls"
+        fi
+        fc_save
+        [[ -n "$fdir" ]] && rm -rf -- "$fdir"
+        TMP_DIRS=()
+        return 0
+    fi
     [[ -n "$fdir" ]] && rm -rf -- "$fdir"
     TMP_DIRS=()
     if (( ${#save_tmp[@]} > 0 )); then
@@ -2902,9 +3853,17 @@ prep_file() {
                     n_s=$(wc -l < "$sname")
                     RESULT_FILES+=("$sname")
                     say "  ⤷ ${what} — в ${sname}: $(fmt_num "$n_s") (как есть)" "  ⤷ ${what} to ${sname}: $(fmt_num "$n_s") (as they are)"
-                    say "    Разобрать потом: пункт 2 на ${sname} с кодировкой WINDOWS-1251 (на вопрос о кодировке)," "    To sort them out later: item 2 on ${sname} with the encoding WINDOWS-1251 (at the encoding question),"
-                    say "    потом пункт 2 на его _prep — «Восстановить кракозябры?» да (DOS и KOI8-R станут русскими)," "    then item 2 on its _prep — «Restore mojibake?» yes (DOS and KOI8-R become Russian),"
-                    say "    потом утилита 7.10 — по алфавитам: русское в _cyr; дальше — пункт 3 или 4" "    then tool 7.10 — by alphabet: Russian goes to _cyr; then item 3 or 4"
+                    if $do_lineenc; then
+                        d8_mix_text rest
+                        if [[ -n "$D8M_TXT" ]]; then
+                            say "    Это строки, которые не перевелись (доли по выборке): ${D8M_TXT}" "    These are the lines that were not converted (shares by the sample): ${D8M_TXT}"
+                        else
+                            say "    Это строки, которые не перевелись: кодировку не определить" "    These are the lines that were not converted: the encoding cannot be told"
+                        fi
+                    else
+                        say "    Разобрать потом: пункт 2 на ${sname} — он подставит кодировку или, если их несколько, предложит перевести каждую строку из её кодировки;" "    To sort them out later: item 2 on ${sname} — it fills in the encoding or, if there are several, offers to convert each line from its own;"
+                        say "    потом утилита 7.11 — по алфавитам: русское в _cyr; дальше — пункт 3 или 4" "    then tool 7.11 — by alphabet: Russian goes to _cyr; then item 3 or 4"
+                    fi
                 else
                     rm -f -- "$sname"
                     say "${YELLOW}⚠ Не удалось сохранить ${what} в ${sname} — итог от этого не пострадал${NC}" "${YELLOW}⚠ Could not save ${what} to ${sname} — the result is not affected${NC}"
@@ -2951,6 +3910,355 @@ prep_file() {
     PREP_RESULT="$final"
 }
 
+AN_AWK='
+{
+    n++
+    if (step > 1 && n % step) next
+    sm++
+    s = $0
+    sub(/\r$/, "", s)
+    hi = (s ~ /[\200-\377]/)
+    if (hi) { c = gsub(/[\200-\277]/, "&", s); L = length(s) - c } else L = length(s)
+    if (L > maxl) maxl = L
+    if (L < 8) l1++; else if (L <= 16) l2++; else if (L <= 32) l3++; else l4++
+    if (s ~ /^[0-9]+$/) {
+        dg++
+        if (L <= 7) d1++; else if (L == 8) d2++; else if (L <= 10) d3++; else d4++
+    } else if (s ~ /[^A-Za-z0-9\200-\377]/) cs++
+    else if (s ~ /[0-9]/) cld++
+    else if (L > 0) cl++
+    if (index(s, " ") || index(s, "\t")) {
+        sp++
+        if (s ~ /^[ \t]|[ \t]$/) eb++
+    }
+    if (index(s, "@") && s ~ /[A-Za-z0-9._%+\200-\377-]@[A-Za-z0-9.\200-\377-]+\.[A-Za-z\200-\377][A-Za-z\200-\377]/) em++
+    if ((index(s, ":") || index(s, ";")) && !index(s, "://") && s ~ /^[^:;]+[:;][^:;]/) up++
+    if (index(s, "//") || index(s, "ww") || index(s, "WW")) { lo = tolower(s); if (lo ~ /(https?|ftp):\/\/|www\./) ur++ }
+    if (index(s, ".") && s ~ /(^|[^0-9.])[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?($|[^0-9])/) ip++
+    if (!hi) { asc++; next }
+    k = 0; w = ""
+    if (s ~ /[A-Za-z]|\303[\200-\277]|[\304-\311][\200-\277]/) { k++; w = "latin" }
+    if (s ~ /[\320-\323][\200-\277]|\324[\200-\257]/) { k++; w = "cyr" }
+    if (s ~ /\315[\260-\277]|[\316\317][\200-\277]/) { k++; w = "greek" }
+    if (s ~ /\326[\220-\277]|\327[\200-\277]/) { k++; w = "hebrew" }
+    if (s ~ /[\330-\333][\200-\277]|\335[\220-\277]|\357[\255-\267\271-\273][\200-\277]/) { k++; w = "arabic" }
+    if (s ~ /\343[\200-\277][\200-\277]|[\344-\351][\200-\277][\200-\277]|\352[\260-\277][\200-\277]|[\353\354][\200-\277][\200-\277]|\355[\200-\236][\200-\277]|\357[\244-\253][\200-\277]|\360[\240-\257][\200-\277][\200-\277]/) { k++; w = "cjk" }
+    if (k == 0) w = "other"; else if (k > 1) w = "mixed"
+    a[w]++
+    if (s ~ /\303[\200-\277]|[\304-\311][\200-\277]/) dia++
+    if (s ~ /\321[\224\226\227]|\322[\220\221]|\320[\204\206\207]/) ukr++
+    if (s ~ /\321\236|\320\216/) bel++
+    if (s ~ /\321[\222\223\225\230\231\232\233\234\237]|\320[\202\203\205\210\211\212\213\214\217]/) srb++
+}
+function e(x) { return int(x * f + 0.5) }
+END {
+    f = (sm > 0) ? n / sm : 1
+    printf "lines %d\nsample %d\nmaxl %d\nl1 %d\nl2 %d\nl3 %d\nl4 %d\n", n, sm, maxl, e(l1), e(l2), e(l3), e(l4) > out
+    printf "dg %d\nd1 %d\nd2 %d\nd3 %d\nd4 %d\ncs %d\ncld %d\ncl %d\n", e(dg), e(d1), e(d2), e(d3), e(d4), e(cs), e(cld), e(cl) > out
+    printf "sp %d\neb %d\nem %d\nup %d\nur %d\nip %d\nasc %d\ndia %d\nukr %d\nbel %d\nsrb %d\n", e(sp), e(eb), e(em), e(up), e(ur), e(ip), e(asc), e(dia), e(ukr), e(bel), e(srb) > out
+    printf "latin %d\ncyr %d\ngreek %d\nhebrew %d\narabic %d\ncjk %d\nother %d\nmixed %d\n", e(a["latin"]), e(a["cyr"]), e(a["greek"]), e(a["hebrew"]), e(a["arabic"]), e(a["cjk"]), e(a["other"]), e(a["mixed"]) > out
+}'
+_st_an_stats() { LC_ALL=C awk -v BINMODE=3 -v out="$P_AN" -v step="${P_AN_STEP:-1}" "$AN_AWK"; }
+
+an_pct() {
+    local n="$1" t="$2" p
+    if (( t <= 0 || n <= 0 )); then REPLY="0 %"; return; fi
+    p=$(( (n * 1000 + t / 2) / t ))
+    if (( p == 0 )); then L REPLY "< 0,1 %" "< 0.1%"
+    elif [[ "$UI_LANG" == en ]]; then REPLY="$(( p / 10 )).$(( p % 10 ))%"
+    else REPLY="$(( p / 10 )),$(( p % 10 )) %"; fi
+}
+# Width of a string in characters (UTF-8 continuation bytes not counted) into REPLY.
+an_w() {
+    local LC_ALL=C s="$1"
+    s="${s//[$'\x80'-$'\xbf']/}"
+    REPLY=${#s}
+}
+# A row of the analysis report: label, number, share — in columns.
+an_row() {
+    local l="$1" n="$2" p="$3" pad=""
+    an_w "$l"
+    if (( REPLY < 36 )); then printf -v pad '%*s' $(( 36 - REPLY )) ''; else pad=" "; fi
+    l+="${pad}"
+    printf -v pad '%12s' "$n"; l+="$pad"
+    if [[ -n "$p" ]]; then an_w "$p"; printf -v pad '%*s' $(( REPLY < 10 ? 10 - REPLY : 1 )) ''; l+="${pad}${p}"; fi
+    say "${l%"${l##*[! ]}"}"
+}
+
+AN_NEED_PREP=false
+AN_SUGGEST_ALPHA=false
+AN_EMPTY=false
+AN_COPY_OF=""
+# The analysis report: what the dictionary is made of and what to do, in order.
+analyze_report() {
+    local -A A=()
+    local key val t p tot k i=0 removed=0 nonlat=0 refs_n=0 srt=""
+    local -a tips=() inv=()
+    while read -r key val; do A[$key]="$val"; done < "$P_AN"
+    tot=${A[lines]:-0}
+    AN_NEED_PREP=false; AN_SUGGEST_ALPHA=false; AN_EMPTY=false
+
+    say "\n${GREEN}=== Из чего словарь (после подготовки по умолчанию) ===${NC}" "\n${GREEN}=== What the dictionary is made of (after the default preparation) ===${NC}"
+    if (( tot == 0 )); then
+        say "  Строк не осталось" "  No lines are left"
+    else
+        L t "  Строк" "  Lines"; an_row "$t" "$(fmt_num "$tot")" ""
+        if (( ${A[sample]:-0} > 0 && ${A[sample]:-0} < tot )); then
+            say "  Состав — по выборке ($(fmt_num "${A[sample]}") строк): числа ниже примерные" "  Composition by a sample ($(fmt_num "${A[sample]}") lines): the numbers below are approximate"
+        fi
+        say ""
+        say "  Длина в буквах:" "  Length in characters:"
+        L t "    короче 8" "    shorter than 8"; an_pct "${A[l1]}" "$tot"; an_row "$t" "$(fmt_num "${A[l1]}")" "$REPLY"
+        an_pct "${A[l2]}" "$tot"; an_row "    8–16" "$(fmt_num "${A[l2]}")" "$REPLY"
+        an_pct "${A[l3]}" "$tot"; an_row "    17–32" "$(fmt_num "${A[l3]}")" "$REPLY"
+        L t "    длиннее 32" "    longer than 32"; an_pct "${A[l4]}" "$tot"; an_row "$t" "$(fmt_num "${A[l4]}")" "$REPLY"
+        L t "    самая длинная" "    the longest"; an_row "$t" "$(fmt_num "${A[maxl]}")" ""
+        say ""
+        L t "  Только цифры:" "  Digits only:"; an_pct "${A[dg]}" "$tot"; an_row "$t" "$(fmt_num "${A[dg]}")" "$REPLY"
+        if (( ${A[dg]:-0} > 0 )); then
+            L t "    до 7 цифр" "    up to 7 digits"; an_row "$t" "$(fmt_num "${A[d1]}")" ""
+            L t "    8 цифр" "    8 digits"; an_row "$t" "$(fmt_num "${A[d2]}")" ""
+            L t "    9–10 цифр" "    9–10 digits"; an_row "$t" "$(fmt_num "${A[d3]}")" ""
+            L t "    11 и больше" "    11 and more"; an_row "$t" "$(fmt_num "${A[d4]}")" ""
+        fi
+        say ""
+        say "  Из каких знаков:" "  What characters:"
+        L t "    только буквы" "    letters only"; an_pct "${A[cl]}" "$tot"; an_row "$t" "" "$REPLY"
+        L t "    буквы и цифры" "    letters and digits"; an_pct "${A[cld]}" "$tot"; an_row "$t" "" "$REPLY"
+        L t "    со знаками или пробелами" "    with signs or spaces"; an_pct "${A[cs]}" "$tot"; an_row "$t" "" "$REPLY"
+        L t "    с пробелом или табом" "    with a space or tab"; an_row "$t" "$(fmt_num "${A[sp]}")" ""
+        L t "      из них по краям строки" "      of them at the edges"; an_row "$t" "$(fmt_num "${A[eb]}")" ""
+        if (( ${A[em]:-0} + ${A[up]:-0} + ${A[ur]:-0} + ${A[ip]:-0} > 0 )); then
+            say ""
+            say "  Почта, пары, ссылки (строк):" "  Emails, pairs, links (lines):"
+            (( ${A[em]:-0} > 0 )) && { L t "    почта" "    emails"; an_row "$t" "$(fmt_num "${A[em]}")" ""; }
+            (( ${A[up]:-0} > 0 )) && { L t "    вида user:pass" "    user:pass-like"; an_row "$t" "$(fmt_num "${A[up]}")" ""; }
+            (( ${A[ur]:-0} > 0 )) && { L t "    ссылки" "    links"; an_row "$t" "$(fmt_num "${A[ur]}")" ""; }
+            (( ${A[ip]:-0} > 0 )) && an_row "    IP" "$(fmt_num "${A[ip]}")" ""
+        fi
+        say ""
+        say "  Алфавиты (по строкам; языки так не различить):" "  Alphabets (by lines; languages cannot be told this way):"
+        L t "    латиница и ASCII" "    Latin and ASCII"
+        an_pct $(( ${A[asc]:-0} + ${A[latin]:-0} )) "$tot"; an_row "$t" "$(fmt_num $(( ${A[asc]:-0} + ${A[latin]:-0} )))" "$REPLY"
+        (( ${A[dia]:-0} > 0 )) && { L t "      с диакритикой (ä, é, ñ, ß…)" "      with diacritics (ä, é, ñ, ß…)"; an_row "$t" "$(fmt_num "${A[dia]}")" ""; }
+        for k in cyr greek hebrew arabic cjk other mixed; do
+            (( ${A[$k]:-0} > 0 )) || continue
+            nonlat=$(( nonlat + ${A[$k]} ))
+            _tl_alpha_what "$k"; t="    $REPLY"
+            an_pct "${A[$k]}" "$tot"; an_row "$t" "$(fmt_num "${A[$k]}")" "$REPLY"
+            if [[ "$k" == cyr ]]; then
+                (( ${A[ukr]:-0} > 0 )) && { L t "      с і, ї, є, ґ (укр., белор.)" "      with і, ї, є, ґ (Ukr., Bel.)"; an_row "$t" "$(fmt_num "${A[ukr]}")" ""; }
+                (( ${A[bel]:-0} > 0 )) && { L t "      с ў (белорусский)" "      with ў (Belarusian)"; an_row "$t" "$(fmt_num "${A[bel]}")" ""; }
+                (( ${A[srb]:-0} > 0 )) && { L t "      с ђ, ћ, џ, љ, њ, ј… (серб., макед.)" "      with ђ, ћ, џ, љ, њ, ј… (Serb., Mac.)"; an_row "$t" "$(fmt_num "${A[srb]}")" ""; }
+            fi
+        done
+    fi
+
+    if (( ${#AN_PIDS[@]} > 0 )); then wait "${AN_PIDS[@]}" 2>/dev/null; AN_PIDS=(); fi
+    [[ -n "$AN_TMP" && -f "$AN_TMP/sorted" ]] && read -r srt < "$AN_TMP/sorted"
+    [[ "$srt" =~ ^[0-9]+$ ]] && fc_put an.srt "$input" "$srt"
+    shopt -s nullglob
+    local -a rf=("$COMPARE_DIR"/*.txt)
+    shopt -u nullglob
+    refs_n=${#rf[@]}
+    say "\n${GREEN}=== Файл ===${NC}" "\n${GREEN}=== The file ===${NC}"
+    if [[ "$srt" == 0 ]]; then
+        say "  Уже отсортирован по байтам (повторы при этом могут быть)" "  Already sorted by bytes (duplicates are still possible)"
+    elif [[ -n "$srt" ]]; then
+        say "  Не отсортирован — пункты 1, 3 и 4 отсортируют итог сами" "  Not sorted — items 1, 3 and 4 sort the result themselves"
+    fi
+    say "  Повторы не считались: для этого нужна сортировка, а анализ на диск не пишет" "  Duplicates were not counted: that needs sorting, and the analysis does not write to disk"
+    [[ -n "$AN_COPY_OF" ]] && say "  ${YELLOW}⚠ Это копия эталона ${AN_COPY_OF}: в пунктах 1 и 3 итог будет пустым${NC}" "  ${YELLOW}⚠ This is a copy of the reference ${AN_COPY_OF}: in items 1 and 3 the result would be empty${NC}"
+
+    if [[ -n "$enc16" ]]; then
+        L t "Кодировка: файл в ${enc16} — пункт 2 переведёт его в UTF-8 (по умолчанию — да)" "Encoding: the file is ${enc16} — item 2 converts it to UTF-8 (yes by default)"; tips+=("$t")
+    elif [[ -n "$enc" ]]; then
+        L t "Кодировка: файл в ${enc} — пункт 2 переведёт его в UTF-8 (Enter у вопроса о кодировке)" "Encoding: the file is ${enc} — item 2 converts it to UTF-8 (Enter at the encoding question)"; tips+=("$t")
+    fi
+    if $do_mix; then
+        L t "Строки не в UTF-8 ($(fmt_num "$mix_all")) — пункт 2 переведёт их из ${mix_enc}" "Lines not in UTF-8 ($(fmt_num "$mix_all")) — item 2 converts them from ${mix_enc}"; tips+=("$t")
+    fi
+    if (( ${lineenc_all:-0} > 0 )) && ${do_lineenc:-false}; then
+        L t "Строки не в UTF-8 в нескольких кодировках ($(fmt_num "$lineenc_all")) — пункт 2 переведёт каждую из её кодировки" "Lines not in UTF-8 in several encodings ($(fmt_num "$lineenc_all")) — item 2 converts each from its own encoding"; tips+=("$t")
+    fi
+    k=$(( moji_all + dos_all + u8_all + koi_all + s7_all + ${west_all:-0} + ${cesu_all:-0} ))
+    if (( k > 0 )); then
+        L t "Кракозябры (строк: $(fmt_num "$k")) — пункт 2 восстановит их в нормальный текст («да»)" "Mojibake ($(fmt_num "$k") lines) — item 2 restores them to normal text («yes»)"; tips+=("$t")
+    fi
+    $do_strip && has_crlf "$input" && { L t "CRLF" "CRLF"; inv+=("$t"); }
+    $do_strip && has_bom "$input" && { L t "BOM в начале" "a BOM at the start"; inv+=("$t"); }
+    (( feff_mid > 0 )) && { L t "U+FEFF внутри — $(fmt_num "$feff_mid")" "U+FEFF inside: $(fmt_num "$feff_mid")"; inv+=("$t"); }
+    (( cr_mid > 0 )) && { L t "CR внутри строки — $(fmt_num "$cr_mid")" "a CR inside a line: $(fmt_num "$cr_mid")"; inv+=("$t"); }
+    (( nul_word > 0 )) && { L t "слова из UTF-16 — $(fmt_num "$nul_word")" "words from UTF-16: $(fmt_num "$nul_word")"; inv+=("$t"); }
+    (( shy_all > 0 )) && { L t "мягкий перенос — $(fmt_num "$shy_all")" "soft hyphen: $(fmt_num "$shy_all")"; inv+=("$t"); }
+    (( shy8_all > 0 )) && { L t "мягкий перенос байтом AD (строка не в UTF-8) — $(fmt_num "$shy8_all")" "soft hyphen as the byte AD (a line not in UTF-8): $(fmt_num "$shy8_all")"; inv+=("$t"); }
+    local bad_n=-1
+    if $use_counts; then
+        for (( i = 1; i <= nf; i++ )); do
+            val=$(( cnt[i] - cnt[i + 1] ))
+            if (( bad_utf8 > 0 && i == ${fi_bad:-0} )); then bad_n=$val; fi
+            (( val > 0 )) || continue
+            removed=$(( removed + val ))
+            (( i == ${fi_bad:-0} && bad_n >= 0 )) && continue
+            inv+=("${filt[i-1]} — $(fmt_num "$val")")
+        done
+    fi
+    if (( ${#inv[@]} > 0 )); then
+        t="${inv[0]}"; for (( i = 1; i < ${#inv[@]}; i++ )); do t+=", ${inv[i]}"; done
+        L p "Невидимое и мусор — пункт 2 уберёт или исправит: ${t}" "Invisible characters and garbage — item 2 removes or fixes: ${t}"; tips+=("$p")
+    fi
+    if (( bad_n > 0 )); then
+        if (( ${nul_left:-0} > 0 )); then
+            L t "Нечитаемые (не UTF-8, U+FFFD или NUL) — $(fmt_num "$bad_n"): пункт 2 их уберёт; строки не в UTF-8 можно сохранить в _notutf8, чтобы разобрать потом (вопрос о сохранении убранных строк)" "Unreadable (not UTF-8, U+FFFD or NUL): $(fmt_num "$bad_n") — item 2 removes them; the lines not in UTF-8 can be saved to _notutf8 to sort them out later (the question about saving removed lines)"
+        else
+            L t "Нечитаемые (не UTF-8 или U+FFFD) — $(fmt_num "$bad_n"): пункт 2 их уберёт; строки не в UTF-8 можно сохранить в _notutf8, чтобы разобрать потом (вопрос о сохранении убранных строк)" "Unreadable (not UTF-8 or U+FFFD): $(fmt_num "$bad_n") — item 2 removes them; the lines not in UTF-8 can be saved to _notutf8 to sort them out later (the question about saving removed lines)"
+        fi
+        tips+=("$t")
+    elif (( bad_n < 0 && bad_utf8 > 0 )); then
+        L t "Строк не в UTF-8: $(fmt_num "$bad_utf8") — пункт 2 их уберёт; чтобы разобрать потом, сохраните их в _notutf8 (вопрос о сохранении убранных строк)" "Lines not in UTF-8: $(fmt_num "$bad_utf8") — item 2 removes them; to sort them out later, save them to _notutf8 (the question about saving removed lines)"; tips+=("$t")
+    fi
+    if (( tot == 0 && ${#tips[@]} > 0 )); then
+        AN_EMPTY=true
+        if (( bad_utf8 > 0 )); then
+            L t "После подготовки по умолчанию не останется ни строки — с этими ответами пункты 1 и 2 дадут пустой итог. Если в строках не в UTF-8 нужный текст — в пункте 2 укажите их кодировку (вопрос о кодировке)" "After the default preparation no line would be left — with these answers items 1 and 2 give an empty result. If the lines not in UTF-8 hold text you need, give their encoding in item 2 (the encoding question)"
+        else
+            L t "После подготовки по умолчанию не останется ни строки — с этими ответами пункты 1 и 2 дадут пустой итог" "After the default preparation no line would be left — with these answers items 1 and 2 give an empty result"
+        fi
+        tips+=("$t")
+    elif (( ${#tips[@]} > 0 )); then
+        AN_NEED_PREP=true
+    else
+        L t "С ответами по умолчанию подготовка ничего не изменит — можно сразу пункт 1, 3 или 4" "With the default answers preparation would change nothing — items 1, 3 or 4 can go right away"; tips+=("$t")
+    fi
+    if (( tot > 0 )); then
+        if (( ${A[l1]:-0} > 0 )); then
+            an_pct "${A[l1]}" "$tot"
+            L t "Короче 8 букв — ${REPLY}: если нужны пароли от 8, фильтр длины в пункте 2 (вопрос «Фильтровать по длине»)" "Shorter than 8 characters (${REPLY}): if you need passwords of 8 and more, use the length filter of item 2"; tips+=("$t")
+            AN_NEED_PREP=true
+        fi
+        if (( ${A[dg]:-0} > 0 )); then
+            an_pct "${A[dg]}" "$tot"
+            L t "Только цифры — ${REPLY} (до 8 цифр — $(fmt_num $(( ${A[d1]:-0} + ${A[d2]:-0} )))): убрать — фильтр цифр в пункте 2" "Digits only (${REPLY}, up to 8 digits: $(fmt_num $(( ${A[d1]:-0} + ${A[d2]:-0} )))): to remove them, use the digit filter of item 2"; tips+=("$t")
+        fi
+    fi
+    if $AN_EMPTY; then
+        :
+    elif (( refs_n > 0 )); then
+        L t "Повторы и эталоны: пункт 1 — подготовка, без повторов, сравнение с эталонами (в ${COMPARE_DIR}: ${refs_n}); без подготовки — пункт 3" "Duplicates and references: item 1 — preparation, no duplicates, comparison with the references (in ${COMPARE_DIR}: ${refs_n}); without preparation — item 3"; tips+=("$t")
+    else
+        L t "Повторы: убирают пункты 1, 3 и 4 (эталонов в ${COMPARE_DIR} нет — сравнивать не с чем)" "Duplicates: items 1, 3 and 4 remove them (no references in ${COMPARE_DIR} — nothing to compare with)"; tips+=("$t")
+    fi
+    if (( tot > 0 )); then
+        if (( nonlat > 0 && nonlat * 100 >= tot )); then
+            L t "Разные алфавиты (строк не только с латиницей: $(fmt_num "$nonlat")) — разложить по файлам: утилита 7.11" "Different alphabets ($(fmt_num "$nonlat") lines not only Latin) — split into files: tool 7.11"; tips+=("$t")
+            AN_SUGGEST_ALPHA=true
+        fi
+        (( ${A[eb]:-0} > 0 )) && { L t "Пробелы по краям (строк: $(fmt_num "${A[eb]}")) — вынести или обрезать: утилита 7.15" "Spaces at the edges ($(fmt_num "${A[eb]}") lines): move out or trim — tool 7.15"; tips+=("$t"); }
+        (( ${A[em]:-0} * 100 >= tot && ${A[em]:-0} > 0 )) && { L t "Почта (строк: $(fmt_num "${A[em]}")) — логины: утилита 7.1, адреса из дампа: 7.4" "Emails ($(fmt_num "${A[em]}") lines): logins — tool 7.1, addresses out of a dump — 7.4"; tips+=("$t"); }
+        (( ${A[up]:-0} * 100 >= tot && ${A[up]:-0} > 0 )) && { L t "Вида user:pass (строк: $(fmt_num "${A[up]}")) — логины и пароли: утилита 7.2, сами пары из дампа: 7.4" "user:pass-like lines ($(fmt_num "${A[up]}")): logins and passwords — tool 7.2, the pairs themselves out of a dump — 7.4"; tips+=("$t"); }
+    fi
+    say "\n${GREEN}=== Что делать, по порядку ===${NC}" "\n${GREEN}=== What to do, in order ===${NC}"
+    for (( i = 0; i < ${#tips[@]}; i++ )); do say "  $(( i + 1 )). ${tips[i]}"; done
+}
+
+# Analysis of one dictionary: read only, a report and advice.
+analyze_one() {
+    local f="$1" r fs rc
+    fs=$(file_size "$f")
+    say "\n${CYAN}════ Анализ: ${f} ($(fmt_size "$fs")) ════${NC}" "\n${CYAN}════ Analysis: ${f} ($(fmt_size "$fs")) ════${NC}"
+    say "Только чтение: файл не меняется, на диск ничего не пишется, кроме лога (и у больших файлов — чисел проверок в logs/.dedup_cache)." "Read only: the file is unchanged, nothing is written to disk except the log (and, for big files, the check numbers in logs/.dedup_cache)."
+    if ! AN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/dedup_tool.XXXXXX" 2>/dev/null)"; then
+        AN_TMP=""
+        say "${RED}✘ Не удалось создать временную папку${NC}" "${RED}✘ Could not create a temporary folder${NC}" >&2
+        return 1
+    fi
+    fc_load "$f"
+    if fc_get an.srt "$f"; then
+        printf '%s\n' "$REPLY" > "$AN_TMP/sorted"
+        AN_PIDS=()
+    else
+        { LC_ALL=C sort -c -- "$f" 2>/dev/null; echo $? > "$AN_TMP/sorted"; } &
+        AN_PIDS=($!)
+    fi
+    AN_COPY_OF=""
+    shopt -s nullglob
+    for r in "$COMPARE_DIR"/*.txt; do
+        (( fs > 0 && $(file_size "$r") == fs )) || continue
+        if same_content "$f" "$r" "$fs"; then AN_COPY_OF="$r"; break; fi
+    done
+    shopt -u nullglob
+    PREP_ANALYZE=true
+    AN_AT_R=" в пункте 2"; AN_AT_E=" of item 2"; AN_Q_R="вопрос в пункте 2"; AN_Q_E="a question of item 2"
+    prep_file "$f" analyze; rc=$?
+    PREP_ANALYZE=false; CONFIRM_AUTO=false
+    AN_AT_R=""; AN_AT_E=""; AN_Q_R="вопрос ниже"; AN_Q_E="a later question"
+    if (( ${#AN_PIDS[@]} > 0 )); then wait "${AN_PIDS[@]}" 2>/dev/null; AN_PIDS=(); fi
+    rm -rf -- "$AN_TMP"; AN_TMP=""
+    return "$rc"
+}
+
+# After the report: offer what to run next.
+analyze_offer() {
+    local f="$1" i q c
+    local -a what=() kind=()
+    ANALYZE_NEXT=()
+    if $AN_NEED_PREP && ! $AN_EMPTY; then
+        L q "Подготовка (пункт 2) с этими ответами (длину и цифры спрошу) → $(final_base "$f")_prep.txt" "Preparation (item 2) with these answers (length and digits are asked) → $(final_base "$f")_prep.txt"
+        what+=("$q"); kind+=(clean)
+    fi
+    if ! $AN_EMPTY && compgen -G "$COMPARE_DIR/*.txt" > /dev/null; then
+        L q "Подготовка с этими ответами, без повторов, сравнение с эталонами (пункт 1) → $(final_base "$f")_final.txt" "Preparation with these answers, no duplicates, comparison with the references (item 1) → $(final_base "$f")_final.txt"
+        what+=("$q"); kind+=(full)
+    fi
+    if $AN_SUGGEST_ALPHA; then
+        L q "Разложить по алфавитам (утилита 7.11)" "Split by alphabets (tool 7.11)"
+        what+=("$q"); kind+=(alphabets)
+    fi
+    (( ${#what[@]} > 0 )) || return 0
+    say "\nЗапустить сейчас:" "\nRun now:"
+    for i in "${!what[@]}"; do say "  ${CYAN}$(( i + 1 )))${NC} ${what[i]}"; done
+    if (( ${#what[@]} == 1 )); then
+        L q "1 — запустить, Enter — ничего: " "1 — run it, Enter — nothing: "
+    else
+        L q "Номер варианта (1–${#what[@]}), Enter — ничего: " "Option number (1–${#what[@]}), Enter — nothing: "
+    fi
+    while true; do
+        ask_value "$q" ""
+        c="${REPLY// /}"
+        [[ -z "$c" ]] && return 0
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( 10#$c >= 1 && 10#$c <= ${#what[@]} )); then
+            ANALYZE_NEXT=("${kind[10#$c - 1]}" "$f")
+            return 0
+        fi
+        if (( ${#what[@]} == 1 )); then
+            say "${YELLOW}⚠ Нет варианта «${c}»: вариант один — 1, Enter — ничего${NC}" "${YELLOW}⚠ No option «${c}»: there is one option — 1, Enter — nothing${NC}"
+        else
+            say "${YELLOW}⚠ Нет варианта «${c}»: номер — слева в списке, от 1 до ${#what[@]}, Enter — ничего${NC}" "${YELLOW}⚠ No option «${c}»: the number is on the left of the list, 1 to ${#what[@]}, Enter — nothing${NC}"
+        fi
+    done
+}
+# Run what was chosen after the analysis.
+analyze_next() {
+    (( ${#ANALYZE_NEXT[@]} > 0 )) || return 0
+    local k="${ANALYZE_NEXT[0]}" f="${ANALYZE_NEXT[1]}" rc=0
+    ANALYZE_NEXT=()
+    case "$k" in
+        clean|full) PREP_AUTO=true; run_action "$k" "$f"; rc=$?; PREP_AUTO=false; CONFIRM_AUTO=false ;;
+        alphabets) TOOL_SUB=alphabets; TOOL_OPTS=(); run_action tool "$f"; rc=$? ;;
+    esac
+    return "$rc"
+}
+# Item 8: analysis of one or several dictionaries.
+cmd_analyze() {
+    local f rc=0
+    say "${CYAN}${SCRIPT_NAME} v${VERSION} — анализ словаря${NC}" "${CYAN}${SCRIPT_NAME} v${VERSION} — dictionary analysis${NC}"
+    for f in "$@"; do
+        analyze_one "$f" || rc=1
+    done
+    (( $# == 1 && rc == 0 )) && analyze_offer "$1"
+    return "$rc"
+}
+
 _st_sortu() { LC_ALL=C sort -u "${SORT_OPTS[@]}"; }
 _st_comm() { LC_ALL=C comm -13 -- "${P_REFS[$1]}" -; }
 _st_testfail() { cat > /dev/null; return 3; }
@@ -2987,7 +4295,9 @@ prepare_refs() {
         for k in "${!QUEUE_REF_SKIP[@]}"; do CMP_SKIP[k]="${QUEUE_REF_SKIP[k]}"; done
         (( ${#CMP_REFS[@]} > 0 )) && say "${GREEN}✓ Эталонов в '$COMPARE_DIR': ${#CMP_REFS[@]} — проверены у первого файла очереди${NC}" "${GREEN}✓ References in '$COMPARE_DIR': ${#CMP_REFS[@]} — checked at the first file of the queue${NC}"
     else
-        if [[ -d "$COMPARE_DIR" ]]; then
+        if $QUEUE_ON; then
+            :
+        elif [[ -d "$COMPARE_DIR" ]]; then
             shopt -s nullglob
             CMP_REFS=("$COMPARE_DIR"/*.txt)
             shopt -u nullglob
@@ -3000,7 +4310,11 @@ prepare_refs() {
                 say "${RED}✘ Нет .txt файлов в '$COMPARE_DIR'${NC}" "${RED}✘ No .txt files in '$COMPARE_DIR'${NC}" >&2
                 return 1
             fi
-            say "${BLUE}Эталонов в '$COMPARE_DIR' нет — файлы очереди чистятся только друг от друга${NC}" "${BLUE}No references in '$COMPARE_DIR' — the queue files are cleaned only of each other${NC}"
+            if [[ -d "$COMPARE_DIR" ]] && compgen -G "$COMPARE_DIR/*.txt" > /dev/null; then
+                say "${BLUE}Эталоны из '$COMPARE_DIR' очередь не берёт (с ними — пункт 1): файлы чистятся только друг от друга${NC}" "${BLUE}The queue does not use the references in '$COMPARE_DIR' (item 1 does): the files are cleaned only of each other${NC}"
+            else
+                say "${BLUE}Эталонов в '$COMPARE_DIR' нет — файлы очереди чистятся только друг от друга${NC}" "${BLUE}No references in '$COMPARE_DIR' — the queue files are cleaned only of each other${NC}"
+            fi
         else
             mapfile -t CMP_REFS < <(printf '%s\n' "${CMP_REFS[@]}" | sort -V)
             say "${GREEN}✓ Найдено эталонных файлов: ${#CMP_REFS[@]}${NC}" "${GREEN}✓ Reference files found: ${#CMP_REFS[@]}${NC}"
@@ -3078,7 +4392,7 @@ cmd_queue() {
     local -a files=("$@") done_f=() done_fin=() done_n=() done_in=() done_hit=()
     local i n=${#files[@]} f fin before k j in_n rc=0 hit hits nh one t
     say "${CYAN}${SCRIPT_NAME} v${VERSION} — несколько словарей по очереди: ${n}${NC}" "${CYAN}${SCRIPT_NAME} v${VERSION} — several dictionaries in a queue: ${n}${NC}"
-    say "Каждый файл чистится от эталонов и от итогов всех предыдущих: первый останется" "Each file is cleaned of the references and of the results of all previous files: the first stays"
+    say "Каждый файл чистится от итогов всех предыдущих: первый останется" "Each file is cleaned of the results of all previous files: the first stays"
     say "целым, в следующих не будет строк, которые уже были раньше. Порядок:" "whole, the next ones will not have lines that came earlier. Order:"
     for i in "${!files[@]}"; do say "  ${GREEN}$((i + 1)).${NC} ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))"; done
     QUEUE_ON=true
@@ -3135,8 +4449,10 @@ cmd_queue() {
     if (( rc == 0 )); then
         if (( ${#QUEUE_REF_SKIP[@]} > 0 )); then
             say "${YELLOW}⚠ Были пропущенные эталоны (см. выше): с ними итоги могут пересекаться${NC}" "${YELLOW}⚠ Some references were skipped (see above): the results may overlap with them${NC}"
-        else
+        elif (( ${#QUEUE_REFS[@]} > 0 )); then
             say "${GREEN}✔ Строки в этих итогах не повторяются ни между собой, ни с эталонами${NC}" "${GREEN}✔ No line repeats across these results or with the references${NC}"
+        else
+            say "${GREEN}✔ Строки в этих итогах не повторяются между собой${NC}" "${GREEN}✔ No line repeats across these results${NC}"
         fi
     fi
     return "$rc"
@@ -3314,6 +4630,9 @@ declare -a TOOL_OPTS=() TOOL_SED=() TOOL_PAT=() TOOL_FILES=() TOOL_REST_KINDS=()
 TOOL_FOUND=false; TOOL_TOP_HEAD=""; TOOL_TOP_STAT=""
 TOOL_EMAIL_RE=$'[[:alnum:]._%+\x80-\xff-]+@[[:alnum:].\x80-\xff-]+\\.[[:alpha:]\x80-\xff]{2,}'
 TOOL_URL_RE=$'(https?|ftp)://[^[:space:]"\'<>:]+(:[0-9]+[^[:space:]"\'<>:]*)?|www\\.[^[:space:]"\'<>:]+'
+TOOL_MAC_RE='(?<![0-9A-Fa-f])(?<![0-9A-Fa-f][:.-])(?:[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])(?!\1[0-9A-Fa-f]{2}(?![0-9A-Za-z]))|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}(?![0-9A-Fa-f])(?!\.[0-9A-Fa-f]))'
+TOOL_UP_URL='([A-Za-z][A-Za-z0-9+.-]*://|[Ww][Ww][Ww]\.)'
+TOOL_UP_PAIR='^[^:;[:space:]]+[:;][^:;]'
 TOOL_IP_RE='(?<![0-9.])(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(?!\.?[0-9])'
 
 # Temporary file next to the result (with "s" — in the sort temp folder); the name goes to REPLY.
@@ -3401,6 +4720,7 @@ tool_utf8_warn() {
     [[ -n "$UTF8_LOCALE" ]] || return 0
     n="$(LC_ALL="$UTF8_LOCALE" grep -a -c -v -x '.*' -- "$TOOL_INPUT" 2>/dev/null)"
     [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 0
+    gap
     say "${YELLOW}⚠ Строк не в UTF-8: $(fmt_num "$n") — буквы в них не распознаются. Сначала подготовьте файл: пункт 2${NC}" "${YELLOW}⚠ Lines not in UTF-8: $(fmt_num "$n") — letters in them are not recognised. Prepare the file first: item 2${NC}"
 }
 
@@ -3427,6 +4747,7 @@ tool_bad_utf8_warn() {
     rm -rf -- "$d"
     TMP_DIRS=("${old_dirs[@]}"); COUNTER_PIDS=("${old_pids[@]}")
     [[ -n "$s" ]] || return 0
+    gap
     say "${YELLOW}⚠ Строк не в UTF-8: ${s}. Сравнение побайтное: с теми же словами в UTF-8 они не совпадут. Сначала подготовьте файлы: пункт 2${NC}" "${YELLOW}⚠ Lines not in UTF-8: ${s}. The comparison is byte by byte: they will not match the same words in UTF-8. Prepare the files first: item 2${NC}"
 }
 
@@ -3452,12 +4773,15 @@ _tl_rest_kinds() {
         emails) LC_ALL=C grep -a -v -E "$TOOL_EMAIL_RE" ;;
         urls)   LC_ALL=C grep -a -v -i -E "$TOOL_URL_RE" ;;
         ip)     LC_ALL=C grep -a -v -P "$TOOL_IP_RE" ;;
+        mac)    LC_ALL=C grep -a -v -P "$TOOL_MAC_RE" ;;
+        userpass) _tl_up_sed rest ;;
     esac | _tl_rest_kinds "$@"
 }
 # Offer the dictionary without the lines something was extracted from: <name>_rest.txt.
 tool_rest() {
     local q t tmp n_in n_out
     $TOOL_FOUND || return 0
+    gap
     say "  Можно сохранить словарь без строк, из которых это извлечено: строка убирается целиком, результат — в новом файле <имя>_rest.txt, исходный не меняется." "  You can save the dictionary without the lines this was extracted from: a line goes as a whole, the result goes to a new file <name>_rest.txt, the source stays unchanged."
     L q "Сохранить словарь без этих строк?" "Save the dictionary without these lines?"
     confirm_action "$q" n || return 0
@@ -3480,7 +4804,7 @@ _tl_edge_only() { LC_ALL=C grep -a -E "$TOOL_EDGE_RE"; }
 _tl_edge_rest() { LC_ALL=C grep -a -v -E "$TOOL_EDGE_RE"; }
 _tl_rtrim() { LC_ALL=C sed -b -E 's/[ \t]+$//' | LC_ALL=C grep -a -v '^$'; }
 _tl_ltrim() { LC_ALL=C sed -b -E 's/^[ \t]+//' | LC_ALL=C grep -a -v '^$'; }
-# Tool 14: lines with spaces or tabs at the edges — move them out, or trim on the right or left.
+# Tool 15: lines with spaces or tabs at the edges — move them out, or trim on the right or left.
 tool_edge() {
     local f="$1" mode="${TOOL_OPTS[0]}" repl="${TOOL_OPTS[1]:-}" n t tmp rest="" suf what q was_sorted=false n_tr n_out
     n="$(_tl_src "$f" | LC_ALL=C grep -a -c -E "$TOOL_EDGE_RE")"
@@ -3497,6 +4821,7 @@ tool_edge() {
     esac
     if [[ "$repl" == ask ]]; then
         repl=""
+        gap
         say "  Обычно результат — в новом файле ${TOOL_BASE}_${suf}.txt, исходный не меняется." "  Normally the result goes to a new file ${TOOL_BASE}_${suf}.txt, the source stays unchanged."
         L q "Заменить сам файл ${f##*/}?" "Replace the file ${f##*/} itself?"
         confirm_action "$q" n && repl=replace
@@ -3562,7 +4887,32 @@ _tl_minus_chain() {
     fi
 }
 _tl_minus() { LC_ALL=C sort -u "${SORT_OPTS[@]}" | _tl_minus_chain 0; }
-# Tool 15: remove from a file the lines that are in other dictionaries.
+# Dictionaries for tools 16 and 17: as they are or a sorted temporary copy.
+tool_prep_dicts() {
+    local f="$1" d tmp t
+    shift
+    TOOL_DICTS=(); TOOL_DICT_TEMPS=()
+    for d in "$@"; do
+        if ! has_crlf "$d" && ! has_bom "$d" && LC_ALL=C sort -c -- "$d" 2>/dev/null; then
+            TOOL_DICTS+=("$d")
+            continue
+        fi
+        tool_tmp s || return 1; tmp="$REPLY"; TOOL_DICT_TEMPS+=("$tmp")
+        say "  ${d}: не отсортирован или с CRLF/BOM — сортирую во временный файл" "  ${d}: not sorted or has CRLF/BOM — sorting into a temporary file"
+        L t "сортировка ${d##*/}" "sort ${d##*/}"
+        progress_start "$t" "$(file_size "$d")" read "$d"
+        if ! LC_ALL=C sed -b -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' -- "$d" | LC_ALL=C sort -u "${SORT_OPTS[@]}" > "$tmp"; then
+            progress_stop
+            rm -f -- "${TOOL_DICT_TEMPS[@]}"; tool_release "${TOOL_DICT_TEMPS[@]}"
+            say "${RED}✘ Не удалось отсортировать ${d} — результат не создан${NC}" "${RED}✘ Could not sort ${d} — no result created${NC}" >&2
+            return 1
+        fi
+        progress_stop
+        TOOL_DICTS+=("$tmp")
+    done
+    return 0
+}
+# Tool 16: remove from a file the lines that are in other dictionaries.
 tool_minus() {
     local f="$1" d tmp t i k n_in out fdir="" use_counts=true n_prev n_now
     shift
@@ -3575,25 +4925,9 @@ tool_minus() {
     done
     sort_opts
     tool_bad_utf8_warn "$f" "${dicts[@]}"
-    TOOL_DICTS=(); TOOL_FIFO=()
-    for d in "${dicts[@]}"; do
-        if ! has_crlf "$d" && ! has_bom "$d" && LC_ALL=C sort -c -- "$d" 2>/dev/null; then
-            TOOL_DICTS+=("$d")
-            continue
-        fi
-        tool_tmp s || return 1; tmp="$REPLY"; temps+=("$tmp")
-        say "  ${d}: не отсортирован или с CRLF/BOM — сортирую во временный файл" "  ${d}: not sorted or has CRLF/BOM — sorting into a temporary file"
-        L t "сортировка ${d##*/}" "sort ${d##*/}"
-        progress_start "$t" "$(file_size "$d")" read "$d"
-        if ! LC_ALL=C sed -b -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' -- "$d" | LC_ALL=C sort -u "${SORT_OPTS[@]}" > "$tmp"; then
-            progress_stop
-            rm -f -- "${temps[@]}"; tool_release "${temps[@]}"
-            say "${RED}✘ Не удалось отсортировать ${d} — результат не создан${NC}" "${RED}✘ Could not sort ${d} — no result created${NC}" >&2
-            return 1
-        fi
-        progress_stop
-        TOOL_DICTS+=("$tmp")
-    done
+    TOOL_FIFO=()
+    tool_prep_dicts "$f" "${dicts[@]}" || return 1
+    temps=("${TOOL_DICT_TEMPS[@]}")
     tool_tmp || return 1; out="$REPLY"
     if fdir="$(mktemp -d "${TMPDIR:-/tmp}/dedup_tool.XXXXXX" 2>/dev/null)"; then
         TMP_DIRS=("$fdir")
@@ -3653,9 +4987,198 @@ tool_minus() {
     tool_finish "$out" minus "$t"
 }
 
+_tl_common_any() {
+    LC_ALL=C sort -u "${SORT_OPTS[@]}" \
+        | LC_ALL=C comm -12 <(LC_ALL=C sort -m -u "${SORT_OPTS[@]}" -- "${TOOL_DICTS[@]}") -
+}
+_tl_common_all_chain() {
+    local i="$1"
+    if (( i >= ${#TOOL_DICTS[@]} )); then cat; return; fi
+    LC_ALL=C comm -12 -- "${TOOL_DICTS[i]}" - | _tl_common_all_chain $(( i + 1 ))
+}
+_tl_common_all() { LC_ALL=C sort -u "${SORT_OPTS[@]}" | _tl_common_all_chain 0; }
+# Tool 17: keep only the lines that are also in other dictionaries.
+tool_common() {
+    local f="$1" mode=any d out t n_in n_out
+    shift
+    [[ "${TOOL_OPTS[0]:-}" == --all ]] && mode=all
+    local -a dicts=("$@")
+    for d in "${dicts[@]}"; do
+        if [[ "$d" -ef "$f" ]]; then
+            say "${RED}✘ ${d} — это тот же файл, что и ${f}: сравнивать его с самим собой нельзя${NC}" "${RED}✘ ${d} is the same file as ${f}: it cannot be compared with itself${NC}" >&2
+            return 1
+        fi
+    done
+    sort_opts
+    tool_bad_utf8_warn "$f" "${dicts[@]}"
+    tool_prep_dicts "$f" "${dicts[@]}" || return 1
+    tool_tmp || return 1; out="$REPLY"
+    if [[ "$mode" == all ]]; then
+        L t "общие строки: есть во всех словарях" "common lines: in every dictionary"
+        tool_stage "$out" "$t" _tl_common_all || { rm -f -- "${TOOL_DICT_TEMPS[@]}" "$out"; tool_release "${TOOL_DICT_TEMPS[@]}" "$out"; return 1; }
+    else
+        L t "общие строки: есть хотя бы в одном словаре" "common lines: in at least one dictionary"
+        tool_stage "$out" "$t" _tl_common_any || { rm -f -- "${TOOL_DICT_TEMPS[@]}" "$out"; tool_release "${TOOL_DICT_TEMPS[@]}" "$out"; return 1; }
+    fi
+    if (( ${#TOOL_DICT_TEMPS[@]} > 0 )); then rm -f -- "${TOOL_DICT_TEMPS[@]}"; tool_release "${TOOL_DICT_TEMPS[@]}"; fi
+    n_in="$(wc -l < "$f")"; n_out="$(wc -l < "$out")"
+    say "Строк на входе: $(fmt_num "$n_in"), общих (без повторов): $(fmt_num "$n_out")" "Input lines: $(fmt_num "$n_in"), common (without duplicates): $(fmt_num "$n_out")"
+    if [[ ! -s "$out" ]]; then
+        say "${YELLOW}Общих строк нет — файл не создан${NC}" "${YELLOW}No common lines — no file created${NC}"
+        rm -f -- "$out"; tool_release "$out"
+        return 0
+    fi
+    tool_finish "$out" common "$t"
+}
+
+_tl_byfreq() {
+    LC_ALL=C sort "${SORT_OPTS[@]}" | LC_ALL=C uniq -c | LC_ALL=C sort "${SORT_OPTS[@]}" -s -k1,1nr \
+        | LC_ALL=C sed -b -E 's/^ *[0-9]+ //'
+}
+_tl_bylen() {
+    LC_ALL=C awk -v BINMODE=3 '{ n = length($0) - gsub(/[\200-\277]/, "&"); print n "\t" $0 }' \
+        | LC_ALL=C sort "${SORT_OPTS[@]}" -s -t "$TAB_CHR" "-k1,1n${TOOL_LEN_REV}" | LC_ALL=C cut -f2-
+}
+_tl_shuffle() { LC_ALL=C sort "${SORT_OPTS[@]}" -R; }
+
+_tl_grep_yes() { LC_ALL="$TOOL_GREP_LOC" grep "${TOOL_GREP_OPT[@]}"; }
+_tl_grep_no() { LC_ALL="$TOOL_GREP_LOC" grep -v "${TOOL_GREP_OPT[@]}"; }
+# Tool 9: remove or keep the lines with pieces, whole lines or a regular expression.
+tool_filter() {
+    local f="$1" mode=pieces keep=false save=false ask=false icase=false k t tmp rtmp n_in n_out rc q
+    local opts_done=false
+    local -a pat=() gopt=(-a)
+    for k in "${TOOL_OPTS[@]}"; do
+        if ! $opts_done; then
+            case "$k" in
+                --keep) keep=true; continue ;;
+                --line) mode=line; continue ;;
+                --regex) mode=regex; continue ;;
+                --icase) icase=true; continue ;;
+                --save) save=true; continue ;;
+                --ask-save) ask=true; continue ;;
+                --) opts_done=true; continue ;;
+            esac
+            opts_done=true
+        fi
+        pat+=(-e "$k")
+    done
+    if (( ${#pat[@]} == 0 )); then
+        say "${RED}✘ Нечего искать: не задано ни одного образца${NC}" "${RED}✘ Nothing to look for: no pattern given${NC}" >&2
+        return 1
+    fi
+    case "$mode" in
+        pieces) gopt+=(-F) ;;
+        line)   gopt+=(-F -x) ;;
+        regex)  gopt+=(-E) ;;
+    esac
+    $icase && gopt+=(-i)
+    TOOL_GREP_LOC=C
+    if [[ "$mode" == regex ]] || $icase; then
+        TOOL_GREP_LOC="${UTF8_LOCALE:-C}"
+        tool_utf8_warn
+    fi
+    TOOL_GREP_OPT=("${gopt[@]}" "${pat[@]}")
+    if [[ "$mode" == regex ]]; then
+        LC_ALL="$TOOL_GREP_LOC" grep "${TOOL_GREP_OPT[@]}" < /dev/null > /dev/null 2>&1; rc=$?
+        if (( rc == 2 )); then
+            say "${RED}✘ Ошибка в регулярном выражении — проверьте его (как у grep -E)${NC}" "${RED}✘ An error in the regular expression — check it (as for grep -E)${NC}" >&2
+            return 1
+        fi
+    fi
+    case "$mode" in
+        pieces) L t "кусков: $(( ${#pat[@]} / 2 ))" "pieces: $(( ${#pat[@]} / 2 ))" ;;
+        line)   L t "целых строк: $(( ${#pat[@]} / 2 ))" "whole lines: $(( ${#pat[@]} / 2 ))" ;;
+        regex)  L t "регулярное выражение" "a regular expression" ;;
+    esac
+    $icase && { L q ", без учёта больших и маленьких букв" ", ignoring upper and lower case"; t+="$q"; }
+    say "  Ищу: ${t}" "  Looking for: ${t}"
+    tool_tmp || return 1; tmp="$REPLY"
+    if $keep; then
+        L t "только строки с найденным" "only the lines with a match"
+        tool_stage "$tmp" "$t" _tl_grep_yes || return 1
+    else
+        L t "без строк с найденным" "without the lines with a match"
+        tool_stage "$tmp" "$t" _tl_grep_no || return 1
+    fi
+    n_in="$(wc -l < "$f")"; n_out="$(wc -l < "$tmp")"
+    if $keep; then
+        say "  Оставлено строк: $(fmt_num "$n_out") из $(fmt_num "$n_in")" "  Lines kept: $(fmt_num "$n_out") of $(fmt_num "$n_in")"
+    else
+        say "  Убрано строк: $(fmt_num $(( n_in - n_out ))) из $(fmt_num "$n_in")" "  Lines removed: $(fmt_num $(( n_in - n_out ))) of $(fmt_num "$n_in")"
+    fi
+    if $keep; then tool_finish "$tmp" kept "$t" || return 1
+    else tool_finish "$tmp" filtered "$t" || return 1; fi
+    if $ask && (( n_in > n_out )); then
+        L q "Сохранить убранные строки ($(fmt_num $(( n_in - n_out )))) в отдельный файл <имя>_removed.txt?" "Save the removed lines ($(fmt_num $(( n_in - n_out )))) to a separate file <name>_removed.txt?"
+        confirm_action "$q" n && save=true
+    fi
+    if $save && (( n_in > n_out )); then
+        tool_tmp || return 1; rtmp="$REPLY"
+        L t "убранные строки" "removed lines"
+        if $keep; then tool_stage "$rtmp" "$t" _tl_grep_no || return 1
+        else tool_stage "$rtmp" "$t" _tl_grep_yes || return 1; fi
+        tool_finish "$rtmp" removed "$t" || return 1
+    fi
+    return 0
+}
+
+_tl_uniq_keyed() {
+    local -a ks=(-e 'h' -e 's/^[^\t]*\t//')
+    [[ -n "$TOOL_UNIQ_SEP_RE" ]] && ks+=(-e "s/${TOOL_UNIQ_SEP_RE}.*//" -e '/^$/{' -e 'g' -e 's/^[^\t]*\t//' -e '}')
+    ks+=(-e 's/\t/\x01/g' -e 'G' -e 's/^(.*)\n([^\t]*)\t(.*)$/\2\t\1\t\3/')
+    LC_ALL=C cat -n | LC_ALL=C sed -b -E "${ks[@]}" \
+        | { if $TOOL_UNIQ_NOCASE; then LC_ALL="${UTF8_LOCALE:-C}" sed -b -E 's/^([^\t]*\t)([^\t]*)/\1\L\2/'; else cat; fi; } \
+        | LC_ALL=C sort "${SORT_OPTS[@]}" -t "$TAB_CHR" -s -u -k2,2 \
+        | LC_ALL=C sort "${SORT_OPTS[@]}" -t "$TAB_CHR" -k1,1n | LC_ALL=C cut -f3-
+}
+
 _tl_emails() { LC_ALL=C grep -a -o -E "$TOOL_EMAIL_RE"; }
 _tl_urls() { LC_ALL=C grep -a -o -i -E "$TOOL_URL_RE" | LC_ALL=C sed -b -E 's/[.,;!?)]+$//'; }
 _tl_ips() { LC_ALL=C grep -a -o -P "$TOOL_IP_RE"; }
+_tl_macs() {
+    LC_ALL=C grep -a -o -P "$TOOL_MAC_RE" | LC_ALL=C tr 'A-F' 'a-f' \
+        | LC_ALL=C sed -b -E -e 's/[^0-9a-f]//g' -e 's/^(..)(..)(..)(..)(..)(..)$/\1:\2:\3:\4:\5:\6/'
+}
+_tl_up_sed() {
+    if [[ "$1" == pairs ]]; then
+        LC_ALL=C sed -n -b -E -e "\#^${TOOL_UP_URL}#b u" -e '/:\/\//d' -e "/${TOOL_UP_PAIR}/p" -e d \
+            -e ':u' -e "s#^${TOOL_UP_URL}[^:;]*(:[0-9]+[^:;]*)?[:;]##" -e 't o' -e d \
+            -e ':o' -e "/${TOOL_UP_PAIR}/p" -e d
+    else
+        LC_ALL=C sed -n -b -E -e "\#^${TOOL_UP_URL}#b u" -e '/:\/\//{p;d}' -e "/${TOOL_UP_PAIR}/d" -e p -e d \
+            -e ':u' -e h -e "s#^${TOOL_UP_URL}[^:;]*(:[0-9]+[^:;]*)?[:;]##" -e 't o' -e g -e p -e d \
+            -e ':o' -e "/${TOOL_UP_PAIR}/d" -e g -e p
+    fi
+}
+_tl_userpairs() { _tl_up_sed pairs; }
+
+# sed program for the transliteration of Russian letters into Latin (TOOL_SED).
+tool_translit_build() {
+    local -a mf=(ж ч ш щ ю я ї є Ж Ч Ш Щ Ю Я Ї Є) mt=(zh ch sh sch yu ya yi ye Zh Ch Sh Sch Yu Ya Yi Ye)
+    local -a sf=(а б в г д е ё з и й к л м н о п р с т у ф х ц ы э і ґ А Б В Г Д Е Ё З И Й К Л М Н О П Р С Т У Ф Х Ц Ы Э І Ґ)
+    local -a st=(a b v g d e e z i y k l m n o p r s t u f h c y e i g A B V G D E E Z I Y K L M N O P R S T U F H C Y E I G)
+    local i from="" to=""
+    TOOL_SED=()
+    if [[ -n "$UTF8_LOCALE" ]]; then
+        local up="[ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯІЇЄҐ]"
+        for i in 8 9 10 11 12 13 14 15; do
+            TOOL_SED+=(-e "s/${mf[i]}\(${up}\)/${mt[i]^^}\1/g")
+            TOOL_SED+=(-e "s/\(${up}\)${mf[i]}/\1${mt[i]^^}/g")
+        done
+    fi
+    for i in "${!mf[@]}"; do TOOL_SED+=(-e "s/${mf[i]}/${mt[i]}/g"); done
+    TOOL_SED+=(-e 's/ъ//g' -e 's/ь//g' -e 's/Ъ//g' -e 's/Ь//g')
+    if [[ -n "$UTF8_LOCALE" ]]; then
+        for i in "${!sf[@]}"; do from+="${sf[i]}"; to+="${st[i]}"; done
+        TOOL_SED+=(-e "y/${from}/${to}/")
+    else
+        for i in "${!sf[@]}"; do TOOL_SED+=(-e "s/${sf[i]}/${st[i]}/g"); done
+    fi
+}
+_tl_translit() {
+    LC_ALL=C grep -a -E $'[\xd0\xd1\xd2][\x80-\xbf]' | LC_ALL="${UTF8_LOCALE:-C}" sed -b "${TOOL_SED[@]}"
+}
 
 # sed program for the keyboard layout: ru2en or en2ru.
 tool_layout_build() {
@@ -3897,7 +5420,7 @@ cmd_tool() {
     local f="${1:-}" tmp t what k n_in n_out
     TOOL_INPUT="$f"
     TOOL_BASE="${f%.*}"
-    [[ "$TOOL_SUB" == minus ]] && TOOL_BASE="${TOOL_BASE##*/}"
+    [[ "$TOOL_SUB" == minus || "$TOOL_SUB" == common ]] && TOOL_BASE="${TOOL_BASE##*/}"
     TOOL_STRIP=false
     TOOL_FOUND=false
     if [[ "$TOOL_SUB" != find ]] && { has_crlf "$f" || has_bom "$f"; }; then TOOL_STRIP=true; fi
@@ -3945,13 +5468,15 @@ cmd_tool() {
             ;;
         extract)
             local -a ex_kinds=("${TOOL_OPTS[@]}")
-            (( ${#ex_kinds[@]} > 0 )) || ex_kinds=(emails urls ip)
+            (( ${#ex_kinds[@]} > 0 )) || ex_kinds=(emails urls ip userpass mac)
             for k in "${ex_kinds[@]}"; do
                 tool_tmp s || return 1; tmp="$REPLY"
                 case "$k" in
                     emails) L t "адреса почты" "email addresses"; tool_stage "$tmp" "$t" _tl_emails || return 1 ;;
                     urls)   L t "ссылки" "links"; tool_stage "$tmp" "$t" _tl_urls || return 1 ;;
                     ip)     L t "адреса IP" "IP addresses"; tool_stage "$tmp" "$t" _tl_ips || return 1 ;;
+                    userpass) L t "пары логин:пароль" "login:password pairs"; tool_stage "$tmp" "$t" _tl_userpairs || return 1 ;;
+                    mac)    L t "адреса MAC" "MAC addresses"; tool_stage "$tmp" "$t" _tl_macs || return 1 ;;
                 esac
                 tool_finish "$tmp" "$k" "$t" sort || return 1
             done
@@ -4008,14 +5533,7 @@ cmd_tool() {
             tool_finish "$tmp" trim "$t" || return 1
             ;;
         filter)
-            TOOL_PAT=()
-            for k in "${TOOL_OPTS[@]}"; do TOOL_PAT+=(-e "$k"); done
-            tool_tmp || return 1; tmp="$REPLY"
-            L t "без строк с заданными кусками" "without lines with the given pieces"
-            tool_stage "$tmp" "$t" _tl_filter || return 1
-            n_in="$(wc -l < "$f")"; n_out="$(wc -l < "$tmp")"
-            say "  Убрано строк: $(fmt_num $(( n_in - n_out ))) из $(fmt_num "$n_in")" "  Lines removed: $(fmt_num $(( n_in - n_out ))) of $(fmt_num "$n_in")"
-            tool_finish "$tmp" filtered "$t" || return 1
+            tool_filter "$f" || return 1
             ;;
         alphabets)
             tool_alphabets || return 1
@@ -4025,12 +5543,74 @@ cmd_tool() {
             ;;
         uniq)
             sort_opts
+            TOOL_UNIQ_NOCASE=false; TOOL_UNIQ_SEP_RE=""
+            local usep="" usuf=uniq
+            for (( k = 0; k < ${#TOOL_OPTS[@]}; k++ )); do
+                case "${TOOL_OPTS[k]}" in
+                    --nocase) TOOL_UNIQ_NOCASE=true ;;
+                    --left) k=$(( k + 1 )); usep="${TOOL_OPTS[k]}" ;;
+                esac
+            done
+            [[ -n "$usep" ]] && TOOL_UNIQ_SEP_RE="$(printf '%s' "$usep" | LC_ALL=C sed -e 's#[][\.*^$/(){}+?|]#\\&#g')"
             tool_tmp || return 1; tmp="$REPLY"
-            L t "повторы убраны, порядок прежний" "duplicates removed, the order kept"
-            tool_stage "$tmp" "$t" _tl_uniq || return 1
+            if [[ -n "$usep" ]] || $TOOL_UNIQ_NOCASE; then
+                $TOOL_UNIQ_NOCASE && tool_utf8_warn
+                [[ -n "$usep" ]] && usuf+=_left
+                $TOOL_UNIQ_NOCASE && usuf+=_nocase
+                if [[ -n "$usep" ]] && $TOOL_UNIQ_NOCASE; then
+                    L t "повторы по части строки до «${usep}» без учёта букв убраны, порядок прежний" "duplicates by the part before «${usep}», ignoring case, removed, the order kept"
+                elif [[ -n "$usep" ]]; then
+                    L t "повторы по части строки до «${usep}» убраны, порядок прежний" "duplicates by the part before «${usep}» removed, the order kept"
+                else
+                    L t "повторы без учёта больших и маленьких букв убраны, порядок прежний" "duplicates ignoring upper and lower case removed, the order kept"
+                fi
+                tool_stage "$tmp" "$t" _tl_uniq_keyed || return 1
+            else
+                L t "повторы убраны, порядок прежний" "duplicates removed, the order kept"
+                tool_stage "$tmp" "$t" _tl_uniq || return 1
+            fi
             n_in="$(wc -l < "$f")"; n_out="$(wc -l < "$tmp")"
             say "  Повторов убрано: $(fmt_num $(( n_in - n_out ))) из $(fmt_num "$n_in")" "  Duplicates removed: $(fmt_num $(( n_in - n_out ))) of $(fmt_num "$n_in")"
-            tool_finish "$tmp" uniq "$t" || return 1
+            tool_finish "$tmp" "$usuf" "$t" || return 1
+            ;;
+        common)
+            tool_common "$@" || return 1
+            ;;
+        order)
+            sort_opts
+            tool_tmp || return 1; tmp="$REPLY"
+            TOOL_LEN_REV=""
+            case "${TOOL_OPTS[0]:-freq}" in
+                len)
+                    L t "по длине, сначала короткие" "by length, the short ones first"
+                    tool_stage "$tmp" "$t" _tl_bylen || return 1
+                    tool_finish "$tmp" bylen "$t" || return 1 ;;
+                lenrev)
+                    TOOL_LEN_REV=r
+                    L t "по длине, сначала длинные" "by length, the long ones first"
+                    tool_stage "$tmp" "$t" _tl_bylen || return 1
+                    tool_finish "$tmp" bylen_desc "$t" || return 1 ;;
+                *)
+                    L t "по частоте, сначала самые частые, каждая строка один раз" "by frequency, the most frequent first, each line once"
+                    tool_stage "$tmp" "$t" _tl_byfreq || return 1
+                    tool_finish "$tmp" byfreq "$t" || return 1 ;;
+            esac
+            ;;
+        translit)
+            tool_utf8_warn
+            tool_translit_build
+            tool_tmp || return 1; tmp="$REPLY"
+            L t "транслит (строки с кириллицей)" "transliteration (lines with Cyrillic)"
+            tool_stage "$tmp" "$t" _tl_translit || return 1
+            tool_finish "$tmp" translit "$t" || return 1
+            ;;
+        shuffle)
+            sort_opts
+            tool_tmp || return 1; tmp="$REPLY"
+            L t "случайный порядок строк" "random order of lines"
+            tool_stage "$tmp" "$t" _tl_shuffle || return 1
+            tool_finish "$tmp" shuffled "$t" || return 1
+            say "  Одинаковые строки оказались рядом: у них один случайный ключ" "  Identical lines ended up next to each other: they share one random key"
             ;;
         find)
             tool_find "$@"
@@ -4053,18 +5633,22 @@ tool_usage() {
         echo "  logins <file>"
         echo "  userpass <file>"
         echo "  cut <file> <sep> [left|right|both]"
-        echo "  extract <file> [emails] [urls] [ip]"
+        echo "  extract <file> [emails] [urls] [ip] [userpass] [mac]"
         echo "  layout <file> [ru2en|en2ru]"
         echo "  case <file> lower|upper|cap|uncap|all"
         echo "  spaces <file> remove|first"
         echo "  trim <file>"
-        echo "  filter <file> <piece>..."
+        echo "  filter <file> [--keep] [--line|--regex] [--icase] [--save] [--] <piece>..."
         echo "  alphabets <file>"
         echo "  top [N] <file>..."
-        echo "  uniq <file>"
+        echo "  uniq <file> [--nocase] [--left <sep>]"
         echo "  find <line> [file...]"
         echo "  edge <file> move|right|left [replace]"
         echo "  minus <file> <dictionary>..."
+        echo "  common <file> [--all] <dictionary>..."
+        echo "  order <file> freq|len|lenrev"
+        echo "  shuffle <file>"
+        echo "  translit <file>"
     } >&2
     return 1
 }
@@ -4075,9 +5659,31 @@ tool_cli() {
     TOOL_OPTS=()
     local -a files=()
     case "$sub" in
-        logins|userpass|trim|alphabets|uniq)
+        logins|userpass|trim|alphabets|shuffle|translit)
             (( $# == 1 )) || { tool_usage; return 1; }
             files=("$1")
+            ;;
+        uniq)
+            (( $# >= 1 )) || { tool_usage; return 1; }
+            files=("$1"); shift
+            while (( $# > 0 )); do
+                case "$1" in
+                    --nocase) TOOL_OPTS+=(--nocase); shift ;;
+                    --left) [[ -n "${2:-}" ]] || { tool_usage; return 1; }; TOOL_OPTS+=(--left "$2"); shift 2 ;;
+                    *) tool_usage; return 1 ;;
+                esac
+            done
+            ;;
+        order)
+            (( $# == 2 )) && [[ "$2" =~ ^(freq|len|lenrev)$ ]] || { tool_usage; return 1; }
+            files=("$1"); TOOL_OPTS=("$2")
+            ;;
+        common)
+            (( $# >= 2 )) || { tool_usage; return 1; }
+            files=("$1"); shift
+            if [[ "$1" == --all ]]; then TOOL_OPTS=(--all); shift; fi
+            (( $# >= 1 )) || { tool_usage; return 1; }
+            files+=("$@")
             ;;
         cut)
             (( $# == 2 || $# == 3 )) && [[ -n "$2" ]] || { tool_usage; return 1; }
@@ -4087,7 +5693,7 @@ tool_cli() {
         extract)
             (( $# >= 1 )) || { tool_usage; return 1; }
             files=("$1"); shift
-            for x in "$@"; do [[ "$x" =~ ^(emails|urls|ip)$ ]] || { tool_usage; return 1; }; done
+            for x in "$@"; do [[ "$x" =~ ^(emails|urls|ip|userpass|mac)$ ]] || { tool_usage; return 1; }; done
             TOOL_OPTS=("$@")
             ;;
         layout)
@@ -4106,6 +5712,11 @@ tool_cli() {
             (( $# >= 2 )) || { tool_usage; return 1; }
             files=("$1"); shift
             for x in "$@"; do [[ -n "$x" ]] || { tool_usage; return 1; }; done
+            local nflag=0 y
+            for y in "$@"; do
+                case "$y" in --keep|--line|--regex|--icase|--save) nflag=$(( nflag + 1 )) ;; --) nflag=$(( nflag + 1 )); break ;; *) break ;; esac
+            done
+            (( $# > nflag )) || { tool_usage; return 1; }
             TOOL_OPTS=("$@")
             ;;
         top)
@@ -4158,9 +5769,9 @@ pick_tool_files() {
         return 0
     fi
     for i in "${!files[@]}"; do
-        echo "  $((i + 1))) ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))$(file_mark "${files[i]}")"
+        echo -e "  ${CYAN}$((i + 1)))${NC} ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))${YELLOW}$(file_mark "${files[i]}")${NC}"
     done
-    out "  0) назад" "  0) back"
+    out "  ${CYAN}0)${NC} назад" "  ${CYAN}0)${NC} back"
     while true; do
         L q "Номера через пробел, Enter — все файлы: " "Numbers separated by spaces, Enter — all files: "
         read_line "$q" || return 1; choice="$REPLY"
@@ -4181,7 +5792,7 @@ pick_tool_files() {
     done
 }
 
-# Tool 15: choose the file and the dictionaries to subtract.
+# Tool 16: choose the file and the dictionaries to subtract.
 pick_minus_files() {
     local choice i k q f first=""
     local -a files=() parts=()
@@ -4194,11 +5805,15 @@ pick_minus_files() {
         return 1
     fi
     for i in "${!files[@]}"; do
-        echo "  $((i + 1))) ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))$(file_mark "${files[i]}")"
+        echo -e "  ${CYAN}$((i + 1)))${NC} ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))${YELLOW}$(file_mark "${files[i]}")${NC}"
     done
-    out "  0) назад" "  0) back"
+    out "  ${CYAN}0)${NC} назад" "  ${CYAN}0)${NC} back"
     while [[ -z "$first" ]]; do
-        L q "Из какого файла убирать строки (номер): " "Which file to remove the lines from (number): "
+        if [[ "${PICK_MINUS_WHAT:-}" == common ]]; then
+            L q "В каком файле оставить общие строки (номер): " "Which file to keep the common lines of (number): "
+        else
+            L q "Из какого файла убирать строки (номер): " "Which file to remove the lines from (number): "
+        fi
         read_line "$q" || return 1; choice="$REPLY"
         k="${choice// /}"
         [[ "$k" == 0 || -z "$k" ]] && return 1
@@ -4209,7 +5824,11 @@ pick_minus_files() {
         fi
     done
     while true; do
-        L q "Какие словари вычесть: номера через пробел, Enter — все остальные: " "Which dictionaries to subtract: numbers separated by spaces, Enter — all the others: "
+        if [[ "${PICK_MINUS_WHAT:-}" == common ]]; then
+            L q "С какими словарями сравнить: номера через пробел, Enter — все остальные: " "Which dictionaries to compare with: numbers separated by spaces, Enter — all the others: "
+        else
+            L q "Какие словари вычесть: номера через пробел, Enter — все остальные: " "Which dictionaries to subtract: numbers separated by spaces, Enter — all the others: "
+        fi
         read_line "$q" || return 1; choice="$REPLY"
         read -r -a parts <<< "${choice//,/ }"
         [[ "${parts[*]}" == 0 ]] && return 1
@@ -4241,21 +5860,26 @@ tools_menu() {
         out "  1) Почта → логины (часть до @) → <имя>_logins.txt" "  1) Email → logins (the part before @) → <name>_logins.txt"
         out "  2) user:pass → логины и пароли → <имя>_logins.txt, <имя>_passwords.txt" "  2) user:pass → logins and passwords → <name>_logins.txt, <name>_passwords.txt"
         out "  3) Разделить строку по разделителю → <имя>_left.txt, <имя>_right.txt" "  3) Split a line by a separator → <name>_left.txt, <name>_right.txt"
-        out "  4) Вырезать из дампа почту, ссылки, IP → <имя>_emails.txt, _urls.txt, _ip.txt" "  4) Cut emails, links, IPs out of a dump → <name>_emails.txt, _urls.txt, _ip.txt"
+        out "  4) Вырезать из дампа почту, ссылки, IP, пары user:pass, MAC → <имя>_emails.txt, _urls.txt…" "  4) Cut emails, links, IPs, user:pass pairs, MACs out of a dump → <name>_emails.txt, _urls.txt…"
         out " ${GREEN}Изменить:${NC}" " ${GREEN}Change:${NC}"
         out "  5) Раскладка RU ↔ EN («привет» ↔ «ghbdtn») → <имя>_en.txt, <имя>_ru.txt" "  5) Keyboard layout RU ↔ EN («привет» ↔ «ghbdtn») → <name>_en.txt, <name>_ru.txt"
         out "  6) Регистр: все маленькие, все большие, первая большая или маленькая" "  6) Case: all lower, all upper, first letter upper or lower"
         out "  7) Строки с пробелом: убрать или оставить только первое слово" "  7) Lines with a space: remove them or keep only the first word"
         out "  8) Обрезать пробелы и табы по краям, сдвоенные внутри — в один → <имя>_trim.txt" "  8) Trim spaces and tabs at the edges, double ones inside into one → <name>_trim.txt"
-        out "  9) Убрать строки с заданными символами или кусками → <имя>_filtered.txt" "  9) Remove lines with the given characters or pieces → <name>_filtered.txt"
+        out "  9) Убрать или оставить строки с кусками, целыми строками, регуляркой → <имя>_filtered.txt" "  9) Remove or keep lines with pieces, whole lines, a regular expression → <name>_filtered.txt"
+        out " 10) Транслит: русские буквы латиницей («привет» → «privet») → <имя>_translit.txt" " 10) Transliteration: Russian letters in Latin («привет» → «privet») → <name>_translit.txt"
         out " ${GREEN}Разложить и посчитать:${NC}" " ${GREEN}Sort out and count:${NC}"
-        out " 10) Разложить по алфавитам → <имя>_latin.txt, _cyr.txt, _cjk.txt, _mixed.txt…" " 10) Split by alphabets → <name>_latin.txt, _cyr.txt, _cjk.txt, _mixed.txt…"
-        out " 11) Самые частые строки → <имя>_top.txt" " 11) The most frequent lines → <name>_top.txt"
-        out " 12) Убрать повторы без сортировки, порядок строк прежний → <имя>_uniq.txt" " 12) Remove duplicates without sorting, the order of lines kept → <name>_uniq.txt"
-        out " 13) Найти строку во всех словарях папки: в каких файлах и сколько раз" " 13) Find a line in all dictionaries of the folder: in which files and how many times"
+        out " 11) Разложить по алфавитам → <имя>_latin.txt, _cyr.txt, _cjk.txt, _mixed.txt…" " 11) Split by alphabets → <name>_latin.txt, _cyr.txt, _cjk.txt, _mixed.txt…"
+        out " 12) Самые частые строки → <имя>_top.txt" " 12) The most frequent lines → <name>_top.txt"
+        out " 13) Убрать повторы без сортировки (и без учёта букв, по части строки) → <имя>_uniq.txt" " 13) Remove duplicates without sorting (also ignoring case, by part of a line) → <name>_uniq.txt"
+        out " 14) Найти строку во всех словарях папки: в каких файлах и сколько раз" " 14) Find a line in all dictionaries of the folder: in which files and how many times"
         out " ${GREEN}Почистить:${NC}" " ${GREEN}Clean up:${NC}"
-        out " 14) Пробелы и табы по краям: вынести такие строки, обрезать справа или слева" " 14) Spaces and tabs at the edges: move such lines out, trim on the right or left"
-        out " 15) Убрать из файла строки других словарей → <имя>_minus.txt" " 15) Remove from a file the lines of other dictionaries → <name>_minus.txt"
+        out " 15) Пробелы и табы по краям: вынести такие строки, обрезать справа или слева" " 15) Spaces and tabs at the edges: move such lines out, trim on the right or left"
+        out " 16) Убрать из файла строки других словарей → <имя>_minus.txt" " 16) Remove from a file the lines of other dictionaries → <name>_minus.txt"
+        out " ${GREEN}Сравнить и упорядочить:${NC}" " ${GREEN}Compare and reorder:${NC}"
+        out " 17) Оставить только строки, которые есть и в других словарях → <имя>_common.txt" " 17) Keep only the lines that are also in other dictionaries → <name>_common.txt"
+        out " 18) Упорядочить: по частоте или по длине → <имя>_byfreq.txt, _bylen.txt" " 18) Reorder: by frequency or by length → <name>_byfreq.txt, _bylen.txt"
+        out " 19) Случайный порядок строк → <имя>_shuffled.txt" " 19) Random order of lines → <name>_shuffled.txt"
         out "  0) Назад" "  0) Back"
         L q "Выберите пункт: " "Choose an item: "
         if ! read_line "$q"; then echo; return 0; fi; c="$REPLY"
@@ -4278,12 +5902,12 @@ tools_menu() {
                 ;;
             4)
                 pick_work_file one || continue
-                L q "Что вырезать: 1 — почта, 2 — ссылки, 3 — IP (можно через пробел), Enter — всё: " "What to cut out: 1 — emails, 2 — links, 3 — IPs (several separated by spaces), Enter — everything: "
+                L q "Что вырезать: 1 — почта, 2 — ссылки, 3 — IP, 4 — пары user:pass, 5 — MAC (можно через пробел), Enter — всё: " "What to cut out: 1 — emails, 2 — links, 3 — IPs, 4 — user:pass pairs, 5 — MACs (several separated by spaces), Enter — everything: "
                 read_line "$q" && a="$REPLY" || a=""
                 read -r -a pieces <<< "${a//,/ }"
                 TOOL_SUB=extract
                 for k in "${pieces[@]}"; do
-                    case "$k" in 1) TOOL_OPTS+=(emails) ;; 2) TOOL_OPTS+=(urls) ;; 3) TOOL_OPTS+=(ip) ;; esac
+                    case "$k" in 1) TOOL_OPTS+=(emails) ;; 2) TOOL_OPTS+=(urls) ;; 3) TOOL_OPTS+=(ip) ;; 4) TOOL_OPTS+=(userpass) ;; 5) TOOL_OPTS+=(mac) ;; esac
                 done
                 run_action tool "${PICKED[0]}"
                 ;;
@@ -4317,17 +5941,40 @@ tools_menu() {
             8) pick_work_file one && { TOOL_SUB=trim; run_action tool "${PICKED[0]}"; } ;;
             9)
                 pick_work_file one || continue
-                out "  Строка уходит, если в ней есть хоть один кусок. Ищется как есть, большие и маленькие буквы различаются." "  A line goes if it has at least one of the pieces. They are searched as they are, upper and lower case differ."
-                out "  Например: «- admin» — два куска, уйдут строки с дефисом и строки с admin; «-admin» — один кусок, только такое сочетание." "  For example: «- admin» is two pieces, lines with a hyphen and lines with admin go; «-admin» is one piece, only this exact combination."
-                L q "Что искать: один или несколько кусков через пробел, Enter — назад: " "What to look for: one or several pieces separated by spaces, Enter — back: "
-                read_line "$q" || continue; a="$REPLY"
-                read -r -a pieces <<< "$a"
-                (( ${#pieces[@]} > 0 )) || continue
-                TOOL_SUB=filter; TOOL_OPTS=("${pieces[@]}")
+                local -a fflags=()
+                L q "Что искать: 1 — куски, 2 — целые строки, 3 — регулярное выражение [1]: " "What to look for: 1 — pieces, 2 — whole lines, 3 — a regular expression [1]: "
+                read_line "$q" && k="$REPLY" || k=1
+                case "${k// /}" in 2) fflags+=(--line); k=line ;; 3) fflags+=(--regex); k=regex ;; *) k=pieces ;; esac
+                L q "1 — убрать такие строки, 2 — оставить только их [1]: " "1 — remove such lines, 2 — keep only them [1]: "
+                read_line "$q" && a="$REPLY" || a=1
+                [[ "${a// /}" == 2 ]] && fflags+=(--keep)
+                L q "Большие и маленькие буквы: 1 — различать, 2 — не различать [1]: " "Upper and lower case: 1 — tell apart, 2 — ignore [1]: "
+                read_line "$q" && a="$REPLY" || a=1
+                [[ "${a// /}" == 2 ]] && fflags+=(--icase)
+                if [[ "$k" == regex ]]; then
+                    out "  Регулярное выражение — как у grep -E: например ^[0-9]+\$ — строки из одних цифр, ^.{1,5}\$ — короче шести знаков." "  A regular expression as for grep -E: for example ^[0-9]+\$ — digits only, ^.{1,5}\$ — shorter than six characters."
+                    L q "Регулярное выражение, Enter — назад: " "Regular expression, Enter — back: "
+                    read_line "$q" || continue; a="$REPLY"
+                    [[ -n "$a" ]] || continue
+                    pieces=("$a")
+                else
+                    if [[ "$k" == pieces ]]; then
+                        out "  Строка подходит, если в ней есть хоть один кусок. Ищется как есть." "  A line matches if it has at least one of the pieces. They are searched as they are."
+                        out "  Например: «- admin» — два куска, строки с дефисом и строки с admin; «-admin» — один кусок, только такое сочетание." "  For example: «- admin» is two pieces, lines with a hyphen and lines with admin; «-admin» is one piece, only this exact combination."
+                        L q "Что искать: один или несколько кусков через пробел, Enter — назад: " "What to look for: one or several pieces separated by spaces, Enter — back: "
+                    else
+                        out "  Строка подходит, если она целиком равна одной из заданных." "  A line matches if it is exactly one of the given lines."
+                        L q "Какие строки: одна или несколько через пробел, Enter — назад: " "Which lines: one or several separated by spaces, Enter — back: "
+                    fi
+                    read_line "$q" || continue; a="$REPLY"
+                    read -r -a pieces <<< "$a"
+                    (( ${#pieces[@]} > 0 )) || continue
+                fi
+                TOOL_SUB=filter; TOOL_OPTS=("${fflags[@]}" --ask-save -- "${pieces[@]}")
                 run_action tool "${PICKED[0]}"
                 ;;
-            10) pick_work_file one && { TOOL_SUB=alphabets; run_action tool "${PICKED[0]}"; } ;;
-            11)
+            11) pick_work_file one && { TOOL_SUB=alphabets; run_action tool "${PICKED[0]}"; } ;;
+            12)
                 pick_tool_files || continue
                 L q "Сколько строк в результате [100]: " "How many lines in the result [100]: "
                 read_line "$q" && k="$REPLY" || k=100
@@ -4336,8 +5983,24 @@ tools_menu() {
                 TOOL_SUB=top; TOOL_OPTS=("$((10#$k))")
                 run_action tool "${PICKED[@]}"
                 ;;
-            12) pick_work_file one && { TOOL_SUB=uniq; run_action tool "${PICKED[0]}"; } ;;
             13)
+                pick_work_file one || continue
+                L q "Повторы: 1 — строки целиком, 2 — без учёта больших и маленьких букв, 3 — по части строки до разделителя (user:pass — одна строка на логин), 4 — по части строки и без учёта букв [1]: " "Duplicates: 1 — whole lines, 2 — ignoring upper and lower case, 3 — by the part of a line before a separator (user:pass — one line per login), 4 — by the part and ignoring case [1]: "
+                read_line "$q" && k="$REPLY" || k=1
+                TOOL_SUB=uniq; TOOL_OPTS=()
+                case "${k// /}" in
+                    2) TOOL_OPTS=(--nocase) ;;
+                    3|4)
+                        L q "Разделитель [:]: " "Separator [:]: "
+                        read_line "$q" && a="$REPLY" || a=""
+                        [[ -n "$a" ]] || a=":"
+                        TOOL_OPTS=(--left "$a")
+                        [[ "${k// /}" == 4 ]] && TOOL_OPTS+=(--nocase)
+                        ;;
+                esac
+                run_action tool "${PICKED[0]}"
+                ;;
+            14)
                 L q "Какую строку искать, Enter — назад: " "Which line to look for, Enter — back: "
                 read_line "$q" || continue; a="$REPLY"
                 [[ -n "$a" ]] || continue
@@ -4349,7 +6012,7 @@ tools_menu() {
                 TOOL_SUB=find; TOOL_OPTS=("$a")
                 run_action tool "${TOOL_FILES[@]}"
                 ;;
-            14)
+            15)
                 pick_work_file one || continue
                 L q "1 — вынести такие строки в <имя>_edge.txt и убрать из словаря, 2 — обрезать справа, 3 — обрезать слева, Enter — назад: " "1 — move such lines to <name>_edge.txt and remove them from the dictionary, 2 — trim on the right, 3 — trim on the left, Enter — back: "
                 read_line "$q" || continue; k="$REPLY"
@@ -4360,11 +6023,36 @@ tools_menu() {
                 TOOL_SUB=edge; TOOL_OPTS=("$k" ask)
                 run_action tool "${PICKED[0]}"
                 ;;
-            15)
+            16)
                 pick_minus_files || continue
                 TOOL_SUB=minus; TOOL_OPTS=()
                 run_action tool "${PICKED[@]}"
                 ;;
+            17)
+                PICK_MINUS_WHAT=common
+                pick_minus_files || { PICK_MINUS_WHAT=""; continue; }
+                PICK_MINUS_WHAT=""
+                TOOL_SUB=common; TOOL_OPTS=()
+                if (( ${#PICKED[@]} > 2 )); then
+                    L q "1 — строки, которые есть хотя бы в одном из этих словарей, 2 — которые есть во всех [1]: " "1 — the lines that are in at least one of these dictionaries, 2 — in all of them [1]: "
+                    read_line "$q" && k="$REPLY" || k=1
+                    [[ "${k// /}" == 2 ]] && TOOL_OPTS=(--all)
+                fi
+                run_action tool "${PICKED[@]}"
+                ;;
+            18)
+                pick_work_file one || continue
+                L q "1 — по частоте (сначала самые частые, каждая строка один раз), 2 — по длине, сначала короткие, 3 — по длине, сначала длинные, Enter — назад: " "1 — by frequency (the most frequent first, each line once), 2 — by length, the short ones first, 3 — by length, the long ones first, Enter — back: "
+                read_line "$q" || continue; k="$REPLY"
+                case "${k// /}" in
+                    1) k=freq ;; 2) k=len ;; 3) k=lenrev ;;
+                    *) continue ;;
+                esac
+                TOOL_SUB=order; TOOL_OPTS=("$k")
+                run_action tool "${PICKED[0]}"
+                ;;
+            19) pick_work_file one && { TOOL_SUB=shuffle; TOOL_OPTS=(); run_action tool "${PICKED[0]}"; } ;;
+            10) pick_work_file one && { TOOL_SUB=translit; TOOL_OPTS=(); run_action tool "${PICKED[0]}"; } ;;
             "") ;;
             *) out "${YELLOW}Нет такого пункта: ${c}${NC}" "${YELLOW}No such item: ${c}${NC}" ;;
         esac
@@ -4422,7 +6110,7 @@ wsl_offer_temp() {
         work_txt
         files=("${WORK_TXT[@]}")
     fi
-    if [[ "$ACTION_KIND" != merge && "$ACTION_KIND" != tool ]]; then
+    if [[ "$ACTION_KIND" == full || "$ACTION_KIND" == compare || "$ACTION_KIND" == clean ]]; then
         shopt -s nullglob
         refs=("$COMPARE_DIR"/*.txt)
         shopt -u nullglob
@@ -4496,7 +6184,11 @@ wsl_offer_temp() {
     progress_stop
     ms_now
     WSL_ARGS=()
-    for f in "${files[@]}"; do WSL_ARGS+=("${f##*/}"); done
+    WSL_SRC=()
+    for f in "${files[@]}"; do
+        WSL_ARGS+=("${f##*/}")
+        if [[ "$f" == /* ]]; then WSL_SRC["${f##*/}"]="$f"; else WSL_SRC["${f##*/}"]="$(pwd)/${f#./}"; fi
+    done
     WSL_TEMP_DIR="$dir"
     FINAL_DIR="$ACTION_ORIG_DIR"
     cd "$dir" || return 1
@@ -4644,6 +6336,7 @@ check_ref_copies() {
         for r in "${refs[@]}"; do
             (( $(file_size "$r") == fs )) || continue
             same_content "$f" "$r" "$fs" || continue
+            $found || gap
             say "${YELLOW}⚠ ${f} — копия эталона ${r}: сравнится сам с собой, итог будет пустым${NC}" "${YELLOW}⚠ ${f} is a copy of the reference ${r}: it would be compared with itself, the result would be empty${NC}"
             found=true
             break
@@ -4680,6 +6373,14 @@ run_action() {
     local -a args=("$@")
     local rc name f log_kind="$kind"
     case "$kind" in
+        analyze)
+            if (( ${#args[@]} == 0 )); then
+                say "${RED}Ошибка: укажите файл (${SCRIPT_NAME} analyze <file>...)${NC}" "${RED}Error: give a file (${SCRIPT_NAME} analyze <file>...)${NC}" >&2
+                return 1
+            fi
+            uniq_files "${args[@]}" || return 1
+            args=("${UNIQ_FILES[@]}")
+            ;;
         full|clean|split)
             if [[ -z "${args[0]:-}" || ! -f "${args[0]}" ]]; then
                 say "${RED}Ошибка: укажите существующий файл (${SCRIPT_NAME} ${kind} <file>)${NC}" "${RED}Error: give an existing file (${SCRIPT_NAME} ${kind} <file>)${NC}" >&2
@@ -4723,7 +6424,8 @@ run_action() {
             fi
             ;;
     esac
-    RESULT_FILES=(); ACTION_FILES=(); FINAL_DIR=""; WSL_TEMP_DIR=""; MERGE_MOVE=false
+    RESULT_FILES=(); ACTION_FILES=(); FINAL_DIR=""; WSL_TEMP_DIR=""; MERGE_MOVE=false; CONFIRM_AUTO=false
+    FC=(); FC_FILE=""; FC_NEW=false; WSL_SRC=()
     EXTRA_REFS=(); QUEUE_REFS=(); QUEUE_REF_SKIP=(); QUEUE_REFS_READY=false; QUEUE_ON=false
     MEMO=(); MEMO_NEW=(); MEMO_ON=false
     ACTION_KIND="$kind"
@@ -4749,7 +6451,7 @@ run_action() {
     if [[ "$kind" == compare ]] && (( ${#chk[@]} == 0 )); then work_txt; chk=("${WORK_TXT[@]}"); fi
     local -a arch=("${chk[@]}")
     [[ "$kind" == tool && "$TOOL_SUB" == find ]] && arch=()
-    if [[ "$kind" == full || "$kind" == compare || "$kind" == queue ]]; then
+    if [[ "$kind" == full || "$kind" == compare ]]; then
         shopt -s nullglob
         arch+=("$COMPARE_DIR"/*.txt)
         shopt -u nullglob
@@ -4761,7 +6463,7 @@ run_action() {
         LOG_FILE=""
         return 1
     fi
-    if [[ "$kind" == full || "$kind" == compare || "$kind" == queue ]]; then
+    if [[ "$kind" == full || "$kind" == compare ]]; then
         if ! check_ref_copies "${chk[@]}"; then
             say "\n${YELLOW}Отменено — ничего не сделано${NC}" "\n${YELLOW}Cancelled — nothing done${NC}"
             L t "отменено" "cancelled"; log_footer "$t"
@@ -4772,7 +6474,7 @@ run_action() {
     fi
     local -a orig_args=("${args[@]}")
 
-    if [[ "$kind" != split && ! ( "$kind" == tool && "$TOOL_SUB" == find ) ]] && in_wsl_mnt; then
+    if [[ "$kind" != split && "$kind" != analyze && ! ( "$kind" == tool && "$TOOL_SUB" == find ) ]] && in_wsl_mnt; then
         if wsl_offer_temp "${args[@]}"; then
             args=("${WSL_ARGS[@]}")
         fi
@@ -4781,8 +6483,8 @@ run_action() {
     ACTION_FILES=("${args[@]}")
     SORT_TMP_EFF=""
     case "$kind" in
-        split) ;;
-        tool) case "$TOOL_SUB" in logins|userpass|cut|extract|top|uniq|minus|edge) sort_tmp_prepare "${args[@]}" ;; esac ;;
+        split|analyze) ;;
+        tool) case "$TOOL_SUB" in logins|userpass|cut|extract|top|uniq|minus|edge|common|order|shuffle) sort_tmp_prepare "${args[@]}" ;; esac ;;
         *) sort_tmp_prepare "${args[@]}" ;;
     esac
     case "$kind" in
@@ -4793,6 +6495,7 @@ run_action() {
         queue)   cmd_queue "${args[@]}" ;;
         merge)   cmd_merge "${args[@]}" ;;
         tool)    cmd_tool "${args[@]}" ;;
+        analyze) cmd_analyze "${args[@]}" ;;
     esac
     rc=$?
 
@@ -4877,10 +6580,10 @@ pick_work_file() {
     out "Выберите рабочий файл:" "Choose a working file:"
     for i in "${!files[@]}"; do
         mark="$(file_mark "${files[i]}")"
-        echo "  $((i + 1))) ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))${mark}"
+        echo -e "  ${CYAN}$((i + 1)))${NC} ${files[i]} ($(fmt_size "$(file_size "${files[i]}")"))${YELLOW}${mark}${NC}"
     done
-    [[ "$mode" == many ]] && out "  a) все файлы (кроме списков объединения)" "  a) all files (except merge lists)"
-    out "  0) назад в меню" "  0) back to the menu"
+    [[ "$mode" == many ]] && out "  ${CYAN}a)${NC} все файлы (кроме списков объединения)" "  ${CYAN}a)${NC} all files (except merge lists)"
+    out "  ${CYAN}0)${NC} назад в меню" "  ${CYAN}0)${NC} back to the menu"
     while true; do
         L q "Номер: " "Number: "
         read_line "$q" || return 1; choice="$REPLY"
@@ -4916,7 +6619,7 @@ pick_many_files() {
             is_final "$f" && defs+=("$f")
             is_list "$f" || alls+=("$f")
         else
-            is_final "$f" || is_merged "$f" || is_list "$f" || is_side "$f" || defs+=("$f")
+            is_final "$f" || is_merged "$f" || is_list "$f" || is_side "$f" || is_tool_out "$f" || defs+=("$f")
         fi
     done
     if (( ${#files[@]} < 2 )); then
@@ -4932,10 +6635,10 @@ pick_many_files() {
     else
         out "${CYAN}Несколько словарей по очереди${NC}" "${CYAN}Several dictionaries in a queue${NC}"
         out "Файлы пойдут по очереди: первый останется целым, каждый следующий" "The files go one after another: the first stays whole, each next one"
-        out "очистится от эталонов и от итогов всех предыдущих. После очереди исходные" "is cleaned of the references and of the results of all previous ones. After the queue"
-        out "словари уйдут в папку originals_<дата-время>/, в рабочей папке останутся итоги." "the source dictionaries go to originals_<date-time>/, the results stay in the working folder."
+        out "очистится от итогов всех предыдущих (эталоны очередь не берёт — для них пункт 1)." "is cleaned of the results of all previous ones (the queue does not use references — item 1 does)."
+        out "После очереди исходные словари уйдут в папку originals_<дата-время>/, в рабочей папке останутся итоги." "After the queue the source dictionaries go to originals_<date-time>/, the results stay in the working folder."
         out "Список — от большого файла к меньшему: так больше строк останется в большом." "The list goes from the biggest file to the smallest: this way more lines stay in the big one."
-        L def_text "все по списку, кроме итогов" "all in the list except results"
+        L def_text "все по списку, кроме итогов и файлов утилит" "all in the list except results and tool files"
     fi
     echo
     for i in "${!files[@]}"; do
@@ -5134,9 +6837,10 @@ main_menu() {
         out "  5) Объединить файлы в один без повторов (итоги _final или все) → merged.txt" "  5) Merge files into one without duplicates (_final results or all) → merged.txt"
         out "  6) Разделить готовый файл на части" "  6) Split a finished file into parts"
         out "  7) Работа со словарями: логины, раскладка, регистр, алфавиты, поиск…" "  7) Dictionary tools: logins, keyboard layout, case, alphabets, search…"
-        out "  8) Язык / Language: русский" "  8) Language / Язык: English"
+        out "  8) Анализ словаря: только чтение — из чего он и что с ним делать" "  8) Dictionary analysis: read only — what it is made of and what to do"
         out "  9) Временные файлы и память для сортировки" "  9) Temp files and memory for sorting"
-        out " 10) Справка" " 10) Help"
+        out " 10) Язык / Language: русский" " 10) Language / Язык: English"
+        out " 11) Справка" " 11) Help"
         out "  0) Выход" "  0) Exit"
         L q "Выберите пункт: " "Choose an item: "
         if ! read_line "$q"; then
@@ -5159,9 +6863,10 @@ main_menu() {
                 fi
                 ;;
             7) tools_menu ;;
-            8) lang_menu ;;
+            8) pick_work_file many && { run_action analyze "${PICKED[@]}"; analyze_next; } ;;
             9) sort_menu ;;
-            10) show_help ;;
+            10) lang_menu ;;
+            11) show_help ;;
             0) exit 0 ;;
             "") ;;
             *) out "${YELLOW}Нет такого пункта: ${choice}${NC}" "${YELLOW}No such item: ${choice}${NC}" ;;
@@ -5193,6 +6898,13 @@ case "${1:-}" in
         shift
         run_action "$cmd" "$@"
         exit $?
+        ;;
+    analyze)
+        shift
+        run_action analyze "$@"
+        rc=$?
+        (( rc == 0 )) && { analyze_next; rc=$?; }
+        exit $rc
         ;;
     *)
         out "${RED}Неизвестная команда: $1${NC}" "${RED}Unknown command: $1${NC}" >&2

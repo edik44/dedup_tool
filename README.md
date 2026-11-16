@@ -11,21 +11,23 @@ A typical use: you collect password or login dictionaries from different sources
 - **One pass, no intermediate files.** Preparation → `sort -u` → `comm -13` with each reference → `<name>_final.txt`. Only the result is written, plus the temporary files of `sort` itself when the data does not fit in memory.
 - **Preparation.** Each step is a question with a sensible default, and the count and examples come before it:
   - UTF-16 → UTF-8 (by the BOM or by null bytes);
-  - single-byte Cyrillic (Windows-1251, KOI8-R, CP866) is recognized automatically; a mixed file is converted line by line, and its UTF-8 lines are left alone;
+  - single-byte Cyrillic (Windows-1251, KOI8-R, CP866) is recognized automatically; a file mixed with UTF-8 is converted line by line, and its UTF-8 lines are left alone;
+  - a file with several one-byte encodings at once: each line is converted from its own one — Windows-1251 (also Belarusian and Ukrainian і ў ї є ґ), KOI8-R, CP866 by Russian letter pairs, Western text from Windows-1252 when its accented letters stand next to Latin ones; what is left can be saved to `<name>_notutf8.txt`;
   - CRLF and BOM, also an invisible U+FEFF inside lines;
   - a CR inside a line: editors show it as a line break, so one line looks like two; such lines are split;
   - words written in UTF-16 inside a UTF-8 file (a NUL after each letter);
-  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251 (`cafГ©` → `café`), Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`), Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs); text damaged twice is restored in one pass, a line cut in the middle of a letter keeps its full letters;
-  - an invisible soft hyphen (U+00AD) inside a word;
+  - mojibake: UTF-8 read as Windows-1252 or Latin-1 (`Ã©tÃ©` → `été`), Russian DOS text read as Windows-1251, UTF-8 read as Windows-1251 (`cafГ©` → `café`), Russian KOI8-R text read as Windows-1251 (`РТЙЧЕФ` → `привет`), Russian DOS text that lost its high bit (the letter «а» became a space, other letters became signs), Western text in Windows-1252 read as Windows-1251 (`Mьller` → `Müller`), emoji in CESU-8 read as Windows-1251; text damaged twice is restored in one pass, a line cut in the middle of a letter keeps its full letters;
+  - an invisible soft hyphen inside a word: U+00AD, and the one-byte soft hyphen (byte AD) inside a Latin word, which makes the line not UTF-8;
   - invalid UTF-8, the replacement character U+FFFD, control characters; for lines not in UTF-8 you see their share of the file and what they look like (Windows-1251, KOI8-R, CP866, Western languages), and how to sort them out later;
   - a byte the chosen encoding has no character for (98 in Windows-1251 — the letter Ш in DOS text) is not cut out of the word: you choose to keep such lines for the second step or to remove them;
   - empty lines and lines of only spaces or tabs;
   - length and digits-only filters; the removed short lines, digit lines and lines not in UTF-8 can be saved to `<name>_short.txt`, `<name>_digits.txt` and `<name>_notutf8.txt`.
 - **References** live in `Compare Files/`. Each file is one "generation" of the comparison, in name order. They are checked (CRLF/BOM, order, duplicates) and fixed only with your consent.
-- **Queue.** Several dictionaries in a row: each is cleaned of the references and of the results of all previous ones, so the results never overlap. The menu lists the files from the biggest to the smallest: Enter is enough, and you can still type the order.
+- **Dictionary analysis** (menu item 8): read only — the same checks as the preparation and a pass without writing: how many lines would be left, what the dictionary is made of (length, digit lines, characters, alphabets, emails and pairs), what to do in order, and what to run right away with the same answers. For big files the counts of the checks are remembered in `logs/.dedup_cache`: a repeated analysis or preparation of the same unchanged file does not read it again (`--recheck` to recount).
+- **Queue.** Several dictionaries in a row: each is cleaned of the results of all previous ones, so the results never overlap (the queue does not use the references — item 1 does). The menu lists the files from the biggest to the smallest: Enter is enough, and you can still type the order.
 - **Merge** results (or all files of the folder) into one file without duplicates; every merge is added to the log `merged_list.txt`, and the merged files can be moved to `originals_<date-time>/`. **Split** a file into parts.
 - **Temp files and memory for sorting** (menu item 9): put the temporary files of `sort` on another disk — for example a removable one, to spare the system SSD when you sort tens of GB — and set its memory: automatic, a size or a share of the free memory.
-- **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links and IPs out of a dump, keyboard layout RU ↔ EN, case, spaces, removing lines by a piece, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries, spaces at the edges of lines, removing the lines of other dictionaries.
+- **Dictionary tools** (menu item 7): emails to logins, `user:pass`, any separator, emails, links, IPs, `user:pass` pairs and MACs out of a dump, keyboard layout RU ↔ EN, transliteration, case, spaces, removing or keeping lines by a piece, a whole line or a regular expression, splitting by alphabets, the most frequent lines, duplicates without sorting, search across dictionaries, spaces at the edges of lines, removing or keeping the lines of other dictionaries, ordering by frequency or length, random order.
 - **WSL.** If the files are on a Windows drive (`/mnt/c`, `/mnt/d`), the script offers to work in a Linux temp folder: line-by-line writing through the WSL bridge is hundreds of times slower.
 - Progress on long steps, a log of every action, statistics per step. It also notices an archive renamed to `.txt`, a working file that is a copy of a reference, and result lines with spaces at the edges.
 
@@ -82,13 +84,14 @@ Run `./dedup_tool.sh` (on Windows — a double click on it; the very first time 
   5) Merge files into one without duplicates (_final results or all) → merged.txt
   6) Split a finished file into parts
   7) Dictionary tools: logins, keyboard layout, case, alphabets, search…
-  8) Language / Язык: English
+  8) Dictionary analysis: read only — what it is made of and what to do
   9) Temp files and memory for sorting
- 10) Help
+ 10) Language / Язык: English
+ 11) Help
   0) Exit
 ```
 
-The script does not change your working files, except tool 14 if you ask it to replace a file; after a queue it moves them to `originals_<date-time>/`, after a merge — only if you agree. References are fixed only after a question. When you type an answer (a folder, an encoding), the arrow keys, Home, End, paste and Tab work as usual.
+The script does not change your working files, except tool 15 if you ask it to replace a file; after a queue it moves them to `originals_<date-time>/`, after a merge — only if you agree. References are fixed only after a question. When you type an answer (a folder, an encoding), the arrow keys, Home, End, paste and Tab work as usual.
 
 ### Without the menu
 
@@ -99,31 +102,37 @@ The script does not change your working files, except tool 14 if you ask it to r
 ./dedup_tool.sh queue a.txt b.txt c.txt
 ./dedup_tool.sh merge [file...]
 ./dedup_tool.sh split words.txt 4
+./dedup_tool.sh analyze words.txt [more.txt...]
+./dedup_tool.sh --recheck analyze words.txt
 ```
 
 `split` also takes a part size: `500M`, `2G`. The answers can be given through stdin, for example `printf 'y\nn\nn\n' | ./dedup_tool.sh full raw.txt`; with `</dev/null` every question takes its default.
 
 ### Dictionary tools
 
-Menu item 7. The source file stays unchanged (except tool 14, if you ask), the result is a new file `<name>_<what>.txt` (if the name is taken — `_2`). Logins, passwords, line parts and addresses come without duplicates in byte order; the rest line for line, in the same order. After tools 1–4 you can save the dictionary without the lines something was extracted from: a line goes as a whole, the file is `_rest`.
+Menu item 7. The source file stays unchanged (except tool 15, if you ask), the result is a new file `<name>_<what>.txt` (if the name is taken — `_2`). Logins, passwords, line parts and addresses come without duplicates in byte order; the rest line for line, in the same order. After tools 1–4 you can save the dictionary without the lines something was extracted from: a line goes as a whole, the file is `_rest`.
 
 | # | What it does | Result |
 |---|---|---|
 | 1 | Emails → logins: the part before `@` | `_logins` |
 | 2 | `user:pass` → logins and passwords, split at the first `:` or `;` | `_logins`, `_passwords` |
 | 3 | Any separator (`:` `/` `;` `---` `(at)`): left and right part | `_left`, `_right` |
-| 4 | Cut emails, links and IP addresses out of a dump | `_emails`, `_urls`, `_ip` |
+| 4 | Cut emails, links, IP addresses, `user:pass` pairs and MACs out of a dump | `_emails`, `_urls`, `_ip`, `_userpass`, `_mac` |
 | 5 | Keyboard layout: `привет` → `ghbdtn` and back | `_en`, `_ru` |
 | 6 | Case: all lower, all upper, first letter upper or lower, or all four files at once | `_lower`, `_upper`, `_cap`, `_uncap` |
 | 7 | Lines with a space: remove them or keep only the first word | `_nospace`, `_firstword` |
 | 8 | Trim spaces and tabs at the edges, double ones inside into one | `_trim` |
-| 9 | Remove lines with the given pieces (`- _ admin`) | `_filtered` |
-| 10 | Split by alphabets; several alphabets in a line — `_mixed` | `_latin`, `_cyr`, `_greek`, `_hebrew`, `_arabic`, `_cjk`, `_other`, `_mixed` |
-| 11 | The most frequent lines: how many times and, for several files, in how many | `_top` |
-| 12 | Remove duplicates without sorting, the order of lines kept | `_uniq` |
-| 13 | Find a line in the dictionaries of the folder and in references: where and how many times | screen and log |
-| 14 | Spaces and tabs at the edges: move such lines out, trim on the right or left; can replace the file itself if you ask | `_edge`, `_noedge`, `_rtrim`, `_ltrim` |
-| 15 | Remove from a file the lines of other dictionaries (without `Compare Files`), sorted, without duplicates | `_minus` |
+| 9 | Remove or keep lines with the given pieces (`- _ admin`), whole lines or a regular expression; case told apart or not; the removed lines can be saved | `_filtered`, `_kept`, `_removed` |
+| 10 | Transliteration: Russian letters in Latin, as typed in passwords (`привет` → `privet`) | `_translit` |
+| 11 | Split by alphabets; several alphabets in a line — `_mixed` | `_latin`, `_cyr`, `_greek`, `_hebrew`, `_arabic`, `_cjk`, `_other`, `_mixed` |
+| 12 | The most frequent lines: how many times and, for several files, in how many | `_top` |
+| 13 | Remove duplicates without sorting, the order of lines kept; also ignoring case, or by the part before a separator (one line per login) | `_uniq`, `_uniq_nocase`, `_uniq_left` |
+| 14 | Find a line in the dictionaries of the folder and in references: where and how many times | screen and log |
+| 15 | Spaces and tabs at the edges: move such lines out, trim on the right or left; can replace the file itself if you ask | `_edge`, `_noedge`, `_rtrim`, `_ltrim` |
+| 16 | Remove from a file the lines of other dictionaries (without `Compare Files`), sorted, without duplicates | `_minus` |
+| 17 | Keep only the lines that are also in other dictionaries (in at least one or in all) | `_common` |
+| 18 | Order by frequency (frequent ones first) or by length | `_byfreq`, `_bylen`, `_bylen_desc` |
+| 19 | Random order of lines (for a sample, for example) | `_shuffled` |
 
 Without the menu:
 
@@ -131,23 +140,28 @@ Without the menu:
 ./dedup_tool.sh tool logins words.txt
 ./dedup_tool.sh tool userpass dump.txt
 ./dedup_tool.sh tool cut dump.txt '---' left
-./dedup_tool.sh tool extract dump.txt emails ip
+./dedup_tool.sh tool extract dump.txt emails ip userpass mac
 ./dedup_tool.sh tool layout words.txt ru2en
+./dedup_tool.sh tool translit words.txt
 ./dedup_tool.sh tool case words.txt lower
 ./dedup_tool.sh tool spaces words.txt first
 ./dedup_tool.sh tool trim words.txt
 ./dedup_tool.sh tool filter words.txt - _ admin
+./dedup_tool.sh tool filter words.txt --keep --regex '^[a-z]+[0-9]{2}$'
 ./dedup_tool.sh tool alphabets words.txt
 ./dedup_tool.sh tool top 100 a.txt b.txt
-./dedup_tool.sh tool uniq words.txt
+./dedup_tool.sh tool uniq words.txt --nocase
 ./dedup_tool.sh tool find secret
 ./dedup_tool.sh tool edge words.txt right
 ./dedup_tool.sh tool minus words.txt other.txt more.txt
+./dedup_tool.sh tool common words.txt --all other.txt more.txt
+./dedup_tool.sh tool order words.txt freq
+./dedup_tool.sh tool shuffle words.txt
 ```
 
 ### Language
 
-The interface follows the system language; in Git Bash and WSL it follows the Windows language. Change it with menu item 8 (the choice is saved), with `--lang en` or `--lang ru`, or with the variable `DEDUP_LANG=en`.
+The interface follows the system language; in Git Bash and WSL it follows the Windows language. Change it with menu item 10 (the choice is saved), with `--lang en` or `--lang ru`, or with the variable `DEDUP_LANG=en`.
 
 ## What it looks like
 
@@ -166,7 +180,7 @@ Input lines: 2,500,000
 ✔ Final file: words_final.txt — lines: 253,323, 5 MB (2.1 s)
 ```
 
-A result converted from Windows-1251 can be bigger than the source: in UTF-8 a Cyrillic letter takes 2 bytes instead of 1. The script says so when it happens.
+A result converted from Windows-1251 can be bigger than the source: in UTF-8 a Cyrillic letter (and an accented Latin one) takes 2 bytes instead of 1. The script says so when it happens.
 
 ## Big files
 

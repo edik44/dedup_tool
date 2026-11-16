@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0 — 2026-11-16
+
+- **Dictionary analysis**, menu item 8 and `analyze <file>...`: read only. The same checks the preparation makes before its questions and a pass without writing with the default answers: how many lines would be left and what the dictionary is made of (length, digit lines, characters, emails and `user:pass` pairs, alphabets), then what to do in order and what to run right away with the same answers (item 2 or 1, tool 7.11). Several files at once — only the reports. The menu is now: 9 — sorting, 10 — language, 11 — help.
+- **A file with several one-byte encodings at once** is converted line by line, each line from its own: Windows-1251, KOI8-R or CP866 by Russian letter pairs (in Windows-1251 also Belarusian and Ukrainian і ў ї є ґ), Western text from Windows-1252 when its accented letters stand next to Latin ones. The lines that fit none stay as they are: the UTF-8 check removes them, they can be saved to `<name>_notutf8.txt`, and you see what they look like.
+- **New kinds of mojibake:** Western text in Windows-1252 read as Windows-1251 (`Mьller` → `Müller`) and emoji in CESU-8 read as Windows-1251.
+- **Soft hyphen as the byte AD** inside a Latin word (the line is not UTF-8 only because of it): its own count, examples and question; the step goes first.
+- If the sample points to one encoding for the lines not in UTF-8, it is suggested in colour and used by Enter; `-` means no conversion, just remove them. An encoding typed for a file that is mostly UTF-8 converts only the lines not in UTF-8.
+- **Queue** (item 4): the dictionaries are cleaned of each other only, the references from `Compare Files/` are not used (item 1 does that). Enter takes all files except results of tools; tool results are marked in file lists.
+- **For big files the counts of the checks are remembered** (`logs/.dedup_cache`: path, size, time, version): a repeated analysis or preparation of an unchanged file does not read it again. `--recheck` or `DEDUP_RECHECK=1` recounts. The checks before the questions run in parallel.
+- **Tools** (item 7): tool 4 also cuts `user:pass` pairs (from links too) and MACs; tool 9 can keep instead of remove, take whole lines or a regular expression, ignore case and save the removed lines; tool 13 can ignore case or look only at the part before a separator. New: 10 — transliteration (`привет` → `privet`), 17 — keep only the common lines, 18 — order by frequency or length, 19 — random order. Splitting by alphabets … removing other dictionaries are now 11–16.
+- **Report:** in columns, empty lines between blocks; «Bigger than the source» names the encodings that were really converted; after the analysis a wrong number asks again; when nothing would be left, items 1 and 2 are not offered.
+- Known issues: Windows-1250 is not among the line-by-line encodings yet; Belarusian words without і and ў are told by Russian letter pairs only.
+
 ## 1.4.0 — 2026-11-11
 
 - **Temp files and memory for sorting**, menu item 9: put the temporary files of `sort` into another folder or on another disk (for example a removable one) and set its memory — automatic, a size (`4G`) or a share of the free memory (`70%`). Saved like the language; also `DEDUP_SORT_TMP` and `DEDUP_SORT_MEM`. The help is now item 10.
